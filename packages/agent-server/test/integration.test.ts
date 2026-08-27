@@ -322,7 +322,7 @@ describe("pi-agent-server HTTP integration", () => {
 			const sessionCookie = cookieValueFromHeader(callback.headers.get("set-cookie"), "pi_agent_session");
 			const home = await fetch(`${baseUrl}/`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } });
 			expect(home.status).toBe(200);
-			expect(await home.text()).toContain("PI / AGENT CONTROL");
+			expect(await home.text()).toContain("PI Agent Server");
 
 			const me = await fetch(`${baseUrl}/auth/me`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } });
 			expect(me.status).toBe(200);
