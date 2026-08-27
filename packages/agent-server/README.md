@@ -21,7 +21,7 @@ Start a run for one configured agent:
 ```bash
 curl -X POST http://127.0.0.1:18731/v1/agents/code-review/runs \
   -H 'content-type: application/json' \
-  -d '{"conversationId":"review-1","input":"Review the current changes"}'
+  -d '{"sessionId":"review-1","input":"Review the current changes"}'
 ```
 
 The response is `202 Accepted` with a `runId`. Poll the status or consume the event stream:
@@ -35,12 +35,15 @@ GET  /auth/me
 POST /auth/hiworks/logout
 GET  /v1/agents
 POST /v1/agents/:agentId/runs
+GET  /v1/agents/:agentId/sessions/:sessionId
 GET  /v1/runs/:runId
 GET  /v1/runs/:runId/events
 POST /v1/runs/:runId/abort
 ```
 
-`conversationId` is optional. Without it, the server creates an isolated conversation. With it, persistent agents resume the corresponding session file. Only one run per agent/conversation can be active at a time; conflicting requests return `409`.
+`sessionId` is optional. Without it, the server creates an isolated session. With it, persistent agents resume the corresponding Pi session file. Only one run per agent/session can be active at a time; conflicting requests return `409`.
+
+`GET /v1/agents/:agentId/sessions/:sessionId` returns the persistent session header, raw entries, session tree, and current context. The URL `sessionId` is the server's stable session key; the response's `piSessionId` is the native Pi session ID from the JSONL header. It uses the authenticated user's session namespace; a missing session or a session owned by another user returns `404`.
 
 The client must select an agent by URL. Model, system prompt, working directory, and tools are always taken from the server-side definition.
 
@@ -54,7 +57,7 @@ Open `/auth/hiworks/login` in the user's browser. After the Hiworks callback com
 
 The callback URL must be registered exactly in the Hiworks OAuth application. By default it is `{publicBaseUrl}{callbackPath}`; set `hiworks.redirectUri` or `PI_AGENT_SERVER_HIWORKS_REDIRECT_URI` when the registered URI must be specified explicitly. Use an HTTPS `publicBaseUrl` for a remote deployment. The built-in `gabia`/`dev` profile supplies the Hiworks endpoints; set `PI_AGENT_SERVER_HIWORKS_CLIENT_ID` and, when required, `PI_AGENT_SERVER_HIWORKS_CLIENT_SECRET` to override the client credentials. The server prints the final redirect URI at startup.
 
-When Hiworks authentication is enabled, each user can access only their own runs, event streams, and abort operations. Persistent sessions are stored below the configured `sessionDir` in a SHA-256-derived user directory, for example `~/.pi/agent-server-/{agentid}/session/<user-hash>/<conversationId>.jsonl`. `PI_AGENT_SERVER_TOKEN` remains an optional administrator credential with access to every user's runs. Authentication sessions are in memory, so a server restart requires users to log in again.
+When Hiworks authentication is enabled, each user can access only their own runs, event streams, and abort operations. Persistent sessions are stored below the configured `sessionDir` in a SHA-256-derived user directory, for example `~/.pi/agent-server-/{agentid}/session/<user-hash>/<sessionId>.jsonl`. `PI_AGENT_SERVER_TOKEN` remains an optional administrator credential with access to every user's runs. Authentication sessions are in memory, so a server restart requires users to log in again.
 
 For API clients that can retain cookies, use a cookie jar after completing the browser login:
 

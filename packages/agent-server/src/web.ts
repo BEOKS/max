@@ -81,7 +81,7 @@ export function renderAgentWebPage(): string {
     <section class="card">
       <form id="run-form">
         <div class="field"><label for="agent">에이전트</label><select id="agent" required disabled><option>불러오는 중…</option></select><span class="agent-meta" id="agent-meta"></span></div>
-        <div class="field"><label for="conversation">대화 ID (선택)</label><input id="conversation" autocomplete="off" placeholder="기존 세션을 이어갈 때 입력"></div>
+        <div class="field"><label for="session">세션 ID (선택)</label><input id="session" autocomplete="off" placeholder="기존 세션을 이어갈 때 입력"></div>
         <div class="field"><label for="prompt">요청</label><textarea id="prompt" required placeholder="에이전트에게 요청할 내용을 입력하세요."></textarea></div>
         <div class="actions"><button class="primary" id="submit" type="submit" disabled>실행</button></div>
       </form>
@@ -102,7 +102,7 @@ export function renderAgentWebPage(): string {
       const agentMeta = document.getElementById('agent-meta');
       const form = document.getElementById('run-form');
       const prompt = document.getElementById('prompt');
-      const conversation = document.getElementById('conversation');
+      const session = document.getElementById('session');
       const submit = document.getElementById('submit');
       const abort = document.getElementById('abort');
       const status = document.getElementById('status');
@@ -162,7 +162,7 @@ export function renderAgentWebPage(): string {
         status.hidden = false;
         status.textContent = labels[currentRun.status] || currentRun.status;
         status.className = 'status ' + currentRun.status;
-        runInfo.textContent = 'run: ' + currentRun.id + ' / conversation: ' + currentRun.conversationId;
+        runInfo.textContent = 'run: ' + currentRun.id + ' / session: ' + currentRun.sessionId;
         if (currentRun.result && typeof currentRun.result.output === 'string') {
           output.textContent = currentRun.result.output || '(응답 없음)';
           output.classList.remove('empty');
@@ -216,7 +216,7 @@ export function renderAgentWebPage(): string {
         submit.disabled = true;
         try {
           const body = { input: input };
-          if (conversation.value.trim()) body.conversationId = conversation.value.trim();
+          if (session.value.trim()) body.sessionId = session.value.trim();
           const run = await api('/v1/agents/' + encodeURIComponent(agentSelect.value) + '/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
           output.textContent = '실행 중…';
           output.classList.add('empty');

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -9,7 +9,7 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { AgentDefinition, AgentRuntime, AgentRuntimeFactory } from "./types.ts";
+import type { AgentDefinition, AgentRuntime, AgentRuntimeFactory, AgentSessionSnapshot } from "./types.ts";
 
 export interface CodingAgentRuntimeFactoryOptions {
 	agentDir: string;
@@ -37,7 +37,7 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 		}
 	}
 
-	async create(definition: AgentDefinition, conversationId: string, ownerId?: string): Promise<AgentRuntime> {
+	async create(definition: AgentDefinition, sessionId: string, ownerId?: string): Promise<AgentRuntime> {
 		const modelRuntime = await this.#getModelRuntime();
 		const model = modelRuntime.getModel(definition.model.provider, definition.model.id);
 		if (!model) {
@@ -60,7 +60,7 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 		});
 		await resourceLoader.reload();
 
-		const sessionManager = await this.#createSessionManager(definition, conversationId, ownerId);
+		const sessionManager = await this.#createSessionManager(definition, sessionId, ownerId);
 		const created = await createAgentSession({
 			cwd: definition.cwd,
 			agentDir: this.#agentDir,
@@ -85,6 +85,33 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 		};
 	}
 
+	async readSession(
+		definition: AgentDefinition,
+		sessionId: string,
+		ownerId?: string,
+	): Promise<AgentSessionSnapshot | undefined> {
+		if (!definition.persistent) return undefined;
+		const agentSessionDir = resolveUserSessionDir(this.#sessionDir, definition.id, ownerId);
+		const sessionPath = join(agentSessionDir, `${sessionId}.jsonl`);
+		try {
+			await access(sessionPath);
+		} catch (error) {
+			if (isFileNotFoundError(error)) return undefined;
+			throw error;
+		}
+
+		const sessionManager = SessionManager.open(sessionPath, agentSessionDir, definition.cwd);
+		return {
+			piSessionId: sessionManager.getSessionId(),
+			header: sessionManager.getHeader(),
+			entries: sessionManager.getEntries(),
+			tree: sessionManager.getTree(),
+			context: sessionManager.buildSessionContext(),
+			sessionName: sessionManager.getSessionName(),
+			leafId: sessionManager.getLeafId(),
+		};
+	}
+
 	async #getModelRuntime(): Promise<ModelRuntime> {
 		const existing = this.#modelRuntimePromise;
 		if (existing) return existing;
@@ -105,13 +132,13 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 
 	async #createSessionManager(
 		definition: AgentDefinition,
-		conversationId: string,
+		sessionId: string,
 		ownerId?: string,
 	): Promise<SessionManager> {
 		if (!definition.persistent) return SessionManager.inMemory(definition.cwd);
 		const agentSessionDir = resolveUserSessionDir(this.#sessionDir, definition.id, ownerId);
 		await mkdir(agentSessionDir, { recursive: true });
-		const sessionPath = join(agentSessionDir, `${conversationId}.jsonl`);
+		const sessionPath = join(agentSessionDir, `${sessionId}.jsonl`);
 		return SessionManager.open(sessionPath, agentSessionDir, definition.cwd);
 	}
 }
@@ -121,6 +148,10 @@ function resolveUserSessionDir(template: string, agentId: string, ownerId: strin
 	if (!ownerId) return agentSessionDir;
 	const ownerDirectory = createHash("sha256").update(ownerId).digest("hex").slice(0, 32);
 	return join(agentSessionDir, ownerDirectory);
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
 function resolveAgentSessionDir(template: string, agentId: string): string {

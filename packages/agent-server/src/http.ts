@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AgentAuthService, AgentPrincipal } from "./auth.ts";
-import { AgentServerError } from "./errors.ts";
+import { AgentServerError, AgentSessionNotFoundError } from "./errors.ts";
 import { type AgentRegistry, isSafeIdentifier } from "./registry.ts";
 import { AgentRunManager } from "./runs.ts";
 import type { AgentRunEvent, AgentRunRequest, AgentRuntimeFactory } from "./types.ts";
@@ -213,10 +213,26 @@ export class AgentApiServer {
 			writeJson(response, 202, {
 				runId: snapshot.id,
 				agentId: snapshot.agentId,
-				conversationId: snapshot.conversationId,
+				sessionId: snapshot.sessionId,
 				status: snapshot.status,
 				statusUrl: `/v1/runs/${snapshot.id}`,
 				eventsUrl: `/v1/runs/${snapshot.id}/events`,
+			});
+			return;
+		}
+
+		if (parts.length === 5 && parts[0] === "v1" && parts[1] === "agents" && parts[3] === "sessions") {
+			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			if (!isSafeIdentifier(parts[4])) {
+				throw new HttpError(400, "invalid_request", "sessionId contains unsupported characters");
+			}
+			const definition = this.#registry.require(parts[2]);
+			const session = await this.#factory.readSession?.(definition, parts[4], ownerId);
+			if (!session) throw new AgentSessionNotFoundError(parts[4]);
+			writeJson(response, 200, {
+				agentId: definition.id,
+				sessionId: parts[4],
+				...session,
 			});
 			return;
 		}
@@ -421,10 +437,13 @@ async function readRunRequest(request: IncomingMessage, maxBodyBytes: number): P
 		throw new HttpError(400, "invalid_request", "input must be a non-empty string");
 	}
 	if (body.conversationId !== undefined) {
-		if (typeof body.conversationId !== "string" || !isSafeIdentifier(body.conversationId)) {
-			throw new HttpError(400, "invalid_request", "conversationId contains unsupported characters");
+		throw new HttpError(400, "invalid_request", "Use sessionId instead of conversationId");
+	}
+	if (body.sessionId !== undefined) {
+		if (typeof body.sessionId !== "string" || !isSafeIdentifier(body.sessionId)) {
+			throw new HttpError(400, "invalid_request", "sessionId contains unsupported characters");
 		}
-		return { input: body.input, conversationId: body.conversationId };
+		return { input: body.input, sessionId: body.sessionId };
 	}
 	return { input: body.input };
 }

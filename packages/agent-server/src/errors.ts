@@ -27,9 +27,16 @@ export class AgentRunNotFoundError extends AgentServerError {
 export class AgentRunConflictError extends AgentServerError {
 	readonly runId: string;
 
-	constructor(runId: string, conversationId: string) {
-		super("conversation_busy", 409, `Conversation is already running: ${conversationId}`);
+	constructor(runId: string, sessionId: string) {
+		super("session_busy", 409, `Session is already running: ${sessionId}`);
 		this.name = "AgentRunConflictError";
 		this.runId = runId;
+	}
+}
+
+export class AgentSessionNotFoundError extends AgentServerError {
+	constructor(sessionId: string) {
+		super("session_not_found", 404, `Unknown session: ${sessionId}`);
+		this.name = "AgentSessionNotFoundError";
 	}
 }

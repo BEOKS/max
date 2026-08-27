@@ -38,7 +38,7 @@ export class AgentRunManager {
 	readonly #maxEventsPerRun: number;
 	readonly #onError: ((error: Error) => void) | undefined;
 	readonly #runs = new Map<string, RunRecord>();
-	readonly #activeConversations = new Map<string, string>();
+	readonly #activeSessions = new Map<string, string>();
 	#closing = false;
 
 	constructor(registry: AgentRegistry, factory: AgentRuntimeFactory, options: AgentRunManagerOptions) {
@@ -52,17 +52,17 @@ export class AgentRunManager {
 	create(agentId: string, request: AgentRunRequest, ownerId?: string): AgentRunSnapshot {
 		if (this.#closing) throw new Error("Agent run manager is closing");
 		const definition = this.#registry.require(agentId);
-		const conversationId = request.conversationId ?? randomUUID();
-		if (!isSafeIdentifier(conversationId)) throw new Error("conversationId contains unsupported characters");
-		const conversationKey = makeConversationKey(ownerId, agentId, conversationId);
-		const activeRunId = this.#activeConversations.get(conversationKey);
-		if (activeRunId) throw new AgentRunConflictError(activeRunId, conversationId);
+		const sessionId = request.sessionId ?? randomUUID();
+		if (!isSafeIdentifier(sessionId)) throw new Error("sessionId contains unsupported characters");
+		const sessionKey = makeSessionKey(ownerId, agentId, sessionId);
+		const activeRunId = this.#activeSessions.get(sessionKey);
+		if (activeRunId) throw new AgentRunConflictError(activeRunId, sessionId);
 
 		const id = randomUUID();
 		const snapshot: AgentRunSnapshot = {
 			id,
 			agentId,
-			conversationId,
+			sessionId,
 			status: "queued",
 			createdAt: new Date().toISOString(),
 		};
@@ -76,8 +76,8 @@ export class AgentRunManager {
 			cancelRequested: false,
 		};
 		this.#runs.set(id, record);
-		this.#activeConversations.set(conversationKey, id);
-		record.completion = this.#execute(record, conversationKey);
+		this.#activeSessions.set(sessionKey, id);
+		record.completion = this.#execute(record, sessionKey);
 		return this.#copySnapshot(record.snapshot);
 	}
 
@@ -113,14 +113,14 @@ export class AgentRunManager {
 		);
 	}
 
-	async #execute(record: RunRecord, conversationKey: string): Promise<void> {
+	async #execute(record: RunRecord, sessionKey: string): Promise<void> {
 		const startedAt = new Date().toISOString();
 		record.snapshot = { ...record.snapshot, status: "running", startedAt };
 		this.#publish(record, {
 			type: "run_started",
 			runId: record.snapshot.id,
 			agentId: record.snapshot.agentId,
-			conversationId: record.snapshot.conversationId,
+			sessionId: record.snapshot.sessionId,
 			timestamp: startedAt,
 		});
 
@@ -131,7 +131,7 @@ export class AgentRunManager {
 				return;
 			}
 
-			const runtime = await this.#factory.create(record.definition, record.snapshot.conversationId, record.ownerId);
+			const runtime = await this.#factory.create(record.definition, record.snapshot.sessionId, record.ownerId);
 			record.runtime = runtime;
 			unsubscribe = runtime.subscribe((event) => {
 				this.#publish(record, {
@@ -195,8 +195,8 @@ export class AgentRunManager {
 				this.#reportError(error);
 			}
 			record.runtime = undefined;
-			if (this.#activeConversations.get(conversationKey) === record.snapshot.id) {
-				this.#activeConversations.delete(conversationKey);
+			if (this.#activeSessions.get(sessionKey) === record.snapshot.id) {
+				this.#activeSessions.delete(sessionKey);
 			}
 			this.#prune();
 		}
@@ -266,8 +266,8 @@ export class AgentRunManager {
 	}
 }
 
-function makeConversationKey(ownerId: string | undefined, agentId: string, conversationId: string): string {
-	return JSON.stringify([ownerId ?? null, agentId, conversationId]);
+function makeSessionKey(ownerId: string | undefined, agentId: string, sessionId: string): string {
+	return JSON.stringify([ownerId ?? null, agentId, sessionId]);
 }
 
 function isAssistantMessage(message: AgentRunResult["messages"][number]): message is AssistantMessage {

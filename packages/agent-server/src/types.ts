@@ -1,5 +1,11 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentSessionEvent,
+	SessionContext,
+	SessionEntry,
+	SessionHeader,
+	SessionTreeNode,
+} from "@earendil-works/pi-coding-agent";
 
 export interface AgentModelReference {
 	provider: string;
@@ -37,14 +43,29 @@ export interface AgentRuntime {
 
 export interface AgentRuntimeFactory {
 	prepare(definitions: readonly AgentDefinition[]): Promise<void>;
-	create(definition: AgentDefinition, conversationId: string, ownerId?: string): Promise<AgentRuntime>;
+	create(definition: AgentDefinition, sessionId: string, ownerId?: string): Promise<AgentRuntime>;
+	readSession?(
+		definition: AgentDefinition,
+		sessionId: string,
+		ownerId?: string,
+	): Promise<AgentSessionSnapshot | undefined>;
+}
+
+export interface AgentSessionSnapshot {
+	readonly piSessionId: string;
+	readonly header: SessionHeader | null;
+	readonly entries: readonly SessionEntry[];
+	readonly tree: readonly SessionTreeNode[];
+	readonly context: SessionContext;
+	readonly sessionName?: string;
+	readonly leafId: string | null;
 }
 
 export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface AgentRunRequest {
 	readonly input: string;
-	readonly conversationId?: string;
+	readonly sessionId?: string;
 }
 
 export interface AgentRunResult {
@@ -55,7 +76,7 @@ export interface AgentRunResult {
 export interface AgentRunSnapshot {
 	readonly id: string;
 	readonly agentId: string;
-	readonly conversationId: string;
+	readonly sessionId: string;
 	readonly status: AgentRunStatus;
 	readonly createdAt: string;
 	readonly startedAt?: string;
@@ -69,7 +90,7 @@ export type AgentRunEvent =
 			type: "run_started";
 			runId: string;
 			agentId: string;
-			conversationId: string;
+			sessionId: string;
 			timestamp: string;
 	  }
 	| {

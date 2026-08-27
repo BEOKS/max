@@ -13,7 +13,7 @@ import {
 import { AgentApiServer } from "../src/http.ts";
 import { AgentRegistry } from "../src/registry.ts";
 import { CodingAgentRuntimeFactory } from "../src/runtime.ts";
-import type { AgentDefinition, AgentRuntime, AgentRuntimeFactory } from "../src/types.ts";
+import type { AgentDefinition, AgentRuntime, AgentRuntimeFactory, AgentSessionSnapshot } from "../src/types.ts";
 
 interface JsonRecord {
 	[key: string]: unknown;
@@ -139,6 +139,13 @@ describe("pi-agent-server HTTP integration", () => {
 			});
 			expect(invalidBody.status).toBe(400);
 
+			const legacySessionField = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+				method: "POST",
+				headers: { ...headers, "Content-Type": "application/json" },
+				body: JSON.stringify({ conversationId: "legacy-name", input: "hello" }),
+			});
+			expect(legacySessionField.status).toBe(400);
+
 			const unknownAgent = await fetch(`${baseUrl}/v1/agents/missing/runs`, {
 				method: "POST",
 				headers: { ...headers, "Content-Type": "application/json" },
@@ -149,7 +156,7 @@ describe("pi-agent-server HTTP integration", () => {
 			const createResponse = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
 				method: "POST",
 				headers: { ...headers, "Content-Type": "application/json" },
-				body: JSON.stringify({ conversationId: "busy-conversation", input: "wait" }),
+				body: JSON.stringify({ sessionId: "busy-session", input: "wait" }),
 			});
 			expect(createResponse.status).toBe(202);
 			const created = (await createResponse.json()) as { runId: string; statusUrl: string; eventsUrl: string };
@@ -159,7 +166,7 @@ describe("pi-agent-server HTTP integration", () => {
 			const conflict = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
 				method: "POST",
 				headers: { ...headers, "Content-Type": "application/json" },
-				body: JSON.stringify({ conversationId: "busy-conversation", input: "second request" }),
+				body: JSON.stringify({ sessionId: "busy-session", input: "second request" }),
 			});
 			expect(conflict.status).toBe(409);
 
@@ -192,7 +199,7 @@ describe("pi-agent-server HTTP integration", () => {
 		}
 	}, 15_000);
 
-	test("isolates runs and conversations between Hiworks users", async () => {
+	test("isolates runs and sessions between Hiworks users", async () => {
 		const factory = new BlockingRuntimeFactory();
 		const server = new AgentApiServer(new AgentRegistry([fakeDefinition]), factory, {
 			host: "127.0.0.1",
@@ -214,25 +221,25 @@ describe("pi-agent-server HTTP integration", () => {
 			const runAResponse = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
 				method: "POST",
 				headers: { ...userAHeaders, "Content-Type": "application/json" },
-				body: JSON.stringify({ conversationId: "shared-name", input: "user A" }),
+				body: JSON.stringify({ sessionId: "shared-name", input: "user A" }),
 			});
 			const runA = (await runAResponse.json()) as { runId: string };
 			expect(runAResponse.status).toBe(202);
 
-			const sameConversationForB = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+			const sameSessionForB = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
 				method: "POST",
 				headers: { ...userBHeaders, "Content-Type": "application/json" },
-				body: JSON.stringify({ conversationId: "shared-name", input: "user B" }),
+				body: JSON.stringify({ sessionId: "shared-name", input: "user B" }),
 			});
-			const runB = (await sameConversationForB.json()) as { runId: string };
-			expect(sameConversationForB.status).toBe(202);
+			const runB = (await sameSessionForB.json()) as { runId: string };
+			expect(sameSessionForB.status).toBe(202);
 
-			const sameConversationForA = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+			const sameSessionForA = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
 				method: "POST",
 				headers: { ...userAHeaders, "Content-Type": "application/json" },
-				body: JSON.stringify({ conversationId: "shared-name", input: "user A again" }),
+				body: JSON.stringify({ sessionId: "shared-name", input: "user A again" }),
 			});
-			expect(sameConversationForA.status).toBe(409);
+			expect(sameSessionForA.status).toBe(409);
 
 			expect((await fetch(`${baseUrl}/v1/runs/${runA.runId}`, { headers: userBHeaders })).status).toBe(404);
 			expect(
@@ -352,6 +359,67 @@ describe("pi-agent-server HTTP integration", () => {
 			await server.close();
 		}
 	}, 15_000);
+
+	test("returns full persistent session data by sessionId", async () => {
+		const definition: AgentDefinition = { ...fakeDefinition, id: "history-agent", persistent: true };
+		const server = new AgentApiServer(new AgentRegistry([definition]), new SessionReadingFactory(), {
+			host: "127.0.0.1",
+			port: 0,
+			hiworksAuth: new TestCookieAuthService(),
+			maxBodyBytes: 64 * 1024,
+			maxRunHistory: 20,
+			maxEventsPerRun: 100,
+		});
+
+		try {
+			await server.start();
+			const baseUrl = server.address;
+			if (!baseUrl) throw new Error("Server did not expose a listening address");
+
+			const userA = await fetch(`${baseUrl}/v1/agents/history-agent/sessions/history`, {
+				headers: { Cookie: "pi_agent_session=user-a" },
+			});
+			expect(userA.status).toBe(200);
+			expect(await userA.json()).toEqual({
+				agentId: "history-agent",
+				sessionId: "history",
+				piSessionId: "session-user-a",
+				header: {
+					type: "session",
+					version: 3,
+					id: "session-user-a",
+					timestamp: "2026-01-01T00:00:00.000Z",
+					cwd: process.cwd(),
+				},
+				entries: [],
+				tree: [],
+				context: { messages: [], thinkingLevel: "off", model: null },
+				sessionName: "User A history",
+				leafId: null,
+			});
+
+			const userB = await fetch(`${baseUrl}/v1/agents/history-agent/sessions/history`, {
+				headers: { Cookie: "pi_agent_session=user-b" },
+			});
+			expect(userB.status).toBe(404);
+			expect(
+				(
+					await fetch(`${baseUrl}/v1/agents/history-agent/sessions/missing`, {
+						headers: { Cookie: "pi_agent_session=user-a" },
+					})
+				).status,
+			).toBe(404);
+			expect(
+				(
+					await fetch(`${baseUrl}/v1/agents/history-agent/sessions/bad%2Fid`, {
+						headers: { Cookie: "pi_agent_session=user-a" },
+					})
+				).status,
+			).toBe(400);
+		} finally {
+			await server.close();
+		}
+	}, 15_000);
 });
 
 class TestCookieAuthService implements AgentAuthService {
@@ -379,6 +447,39 @@ class TestCookieAuthService implements AgentAuthService {
 
 	logout(): string {
 		return "pi_agent_session=; Max-Age=0; Path=/";
+	}
+}
+
+class SessionReadingFactory implements AgentRuntimeFactory {
+	async prepare(): Promise<void> {}
+
+	async create(): Promise<AgentRuntime> {
+		return new BlockingRuntime();
+	}
+
+	async readSession(
+		definition: AgentDefinition,
+		sessionId: string,
+		ownerId?: string,
+	): Promise<AgentSessionSnapshot | undefined> {
+		if (definition.id !== "history-agent" || sessionId !== "history" || ownerId !== "hiworks:gabia:user-a") {
+			return undefined;
+		}
+		return {
+			piSessionId: "session-user-a",
+			header: {
+				type: "session",
+				version: 3,
+				id: "session-user-a",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: definition.cwd,
+			},
+			entries: [],
+			tree: [],
+			context: { messages: [], thinkingLevel: "off", model: null },
+			sessionName: "User A history",
+			leafId: null,
+		};
 	}
 }
 
@@ -439,7 +540,7 @@ describe.skipIf(!integrationEnabled)("pi-agent-server Gemma integration", () => 
 				method: "POST",
 				headers: { ...headers, "Content-Type": "application/json" },
 				body: JSON.stringify({
-					conversationId: "gemma-integration",
+					sessionId: "gemma-integration",
 					input: "Reply with exactly INTEGRATION_TEST_OK.",
 				}),
 			});
@@ -456,11 +557,11 @@ describe.skipIf(!integrationEnabled)("pi-agent-server Gemma integration", () => 
 			expect(statusResponse.status).toBe(200);
 			const snapshot = (await statusResponse.json()) as {
 				status: string;
-				conversationId: string;
+				sessionId: string;
 				result?: { output: string };
 			};
 			expect(snapshot.status).toBe("completed");
-			expect(snapshot.conversationId).toBe("gemma-integration");
+			expect(snapshot.sessionId).toBe("gemma-integration");
 			expect(snapshot.result?.output).toContain("INTEGRATION_TEST_OK");
 
 			const agentSessionDirectory = join(sessionDir, "gemma-smoke", "session");

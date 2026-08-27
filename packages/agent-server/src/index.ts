@@ -32,4 +32,5 @@ export type {
 	AgentRunStatus,
 	AgentRuntime,
 	AgentRuntimeFactory,
+	AgentSessionSnapshot,
 } from "./types.ts";
