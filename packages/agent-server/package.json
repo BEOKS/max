@@ -13,7 +13,8 @@
 		"build": "tsgo -p tsconfig.build.json",
 		"clean": "shx rm -rf dist",
 		"start": "node dist/main.js",
-		"dev": "tsx src/main.ts"
+		"dev": "tsx src/main.ts",
+		"test": "vitest --run"
 	},
 	"dependencies": {
 		"@earendil-works/pi-agent-core": "^0.84.3",
@@ -22,6 +23,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "22.19.19",
-		"shx": "0.4.0"
+		"shx": "0.4.0",
+		"vitest": "4.1.9"
 	}
 }

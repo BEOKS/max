@@ -44,3 +44,15 @@ The client must select an agent by URL. Model, system prompt, working directory,
 See `agent-server.config.example.json`. Each entry under `agents` defines an independent model, prompt, working directory, tool allowlist, and persistence policy. `sessionDir` supports `~` and the `{agentid}` placeholder; the example stores each agent's sessions under `~/.pi/agent-server-/{agentid}/session`. Project-local resources are disabled by default; enable `loadProjectResources` only for trusted workspaces.
 
 This server deliberately has no built-in sandbox. Agents with `bash`, `write`, or `edit` need OS/container/VM isolation and an authenticated deployment boundary.
+
+## Integration test
+
+The Gemma integration test is skipped by default. Run it explicitly with a configured local provider:
+
+```bash
+PI_AGENT_SERVER_GEMMA_INTEGRATION=1 \
+PI_AGENT_DIR=/absolute/path/to/.pi/agent \
+npm run test --workspace=@earendil-works/pi-agent-server -- test/integration.test.ts
+```
+
+The test discovers an authenticated Gemma model from `models.json`, verifies the HTTP API and SSE stream, and confirms that the persistent session file is created.

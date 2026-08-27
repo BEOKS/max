@@ -1,0 +1,330 @@
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, test } from "vitest";
+import { AgentApiServer } from "../src/http.ts";
+import { AgentRegistry } from "../src/registry.ts";
+import { CodingAgentRuntimeFactory } from "../src/runtime.ts";
+import type { AgentDefinition, AgentRuntime, AgentRuntimeFactory } from "../src/types.ts";
+
+interface JsonRecord {
+	[key: string]: unknown;
+}
+
+interface GemmaModel {
+	provider: string;
+	id: string;
+}
+
+const integrationEnabled = process.env.PI_AGENT_SERVER_GEMMA_INTEGRATION === "1";
+let temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+	await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+	temporaryDirectories = [];
+});
+
+const fakeDefinition: AgentDefinition = {
+	id: "fake-agent",
+	cwd: process.cwd(),
+	model: { provider: "fake", id: "fake" },
+	thinkingLevel: "off",
+	systemPrompt: "test",
+	tools: [],
+	persistent: false,
+	loadProjectResources: false,
+};
+
+class BlockingRuntime implements AgentRuntime {
+	readonly messages = [];
+	readonly promptStarted: Promise<void>;
+	readonly #listeners = new Set<Parameters<AgentRuntime["subscribe"]>[0]>();
+	#resolvePromptStarted: (() => void) | undefined;
+	#resolvePrompt: (() => void) | undefined;
+
+	constructor() {
+		this.promptStarted = new Promise<void>((resolve) => {
+			this.#resolvePromptStarted = resolve;
+		});
+	}
+
+	async prompt(): Promise<void> {
+		this.#resolvePromptStarted?.();
+		await new Promise<void>((resolve) => {
+			this.#resolvePrompt = resolve;
+		});
+	}
+
+	async abort(): Promise<void> {
+		this.#resolvePrompt?.();
+	}
+
+	subscribe(listener: Parameters<AgentRuntime["subscribe"]>[0]): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
+	}
+
+	dispose(): void {
+		this.#resolvePrompt?.();
+	}
+}
+
+class BlockingRuntimeFactory implements AgentRuntimeFactory {
+	readonly started: Promise<BlockingRuntime>;
+	#resolveStarted: ((runtime: BlockingRuntime) => void) | undefined;
+
+	constructor() {
+		this.started = new Promise<BlockingRuntime>((resolve) => {
+			this.#resolveStarted = resolve;
+		});
+	}
+
+	async prepare(): Promise<void> {}
+
+	async create(): Promise<AgentRuntime> {
+		const runtime = new BlockingRuntime();
+		this.#resolveStarted?.(runtime);
+		this.#resolveStarted = undefined;
+		return runtime;
+	}
+}
+
+describe("pi-agent-server HTTP integration", () => {
+	test("supports health, auth, run status, SSE, conflict, and abort APIs", async () => {
+		const token = "pi-agent-server-test-token";
+		const factory = new BlockingRuntimeFactory();
+		const server = new AgentApiServer(new AgentRegistry([fakeDefinition]), factory, {
+			host: "127.0.0.1",
+			port: 0,
+			authToken: token,
+			maxBodyBytes: 64 * 1024,
+			maxRunHistory: 20,
+			maxEventsPerRun: 100,
+		});
+
+		try {
+			await server.start();
+			const baseUrl = server.address;
+			if (!baseUrl) throw new Error("Server did not expose a listening address");
+			const headers = { Authorization: `Bearer ${token}` };
+
+			const health = await fetch(`${baseUrl}/healthz`);
+			expect(health.status).toBe(200);
+			expect(await health.json()).toEqual({ ok: true });
+
+			expect((await fetch(`${baseUrl}/v1/agents`)).status).toBe(401);
+			const agents = await fetch(`${baseUrl}/v1/agents`, { headers });
+			expect(agents.status).toBe(200);
+			const agentsBody = (await agents.json()) as { agents: unknown[] };
+			expect(agentsBody.agents).toContainEqual({
+				id: fakeDefinition.id,
+				model: fakeDefinition.model,
+				thinkingLevel: fakeDefinition.thinkingLevel,
+				tools: [],
+				persistent: false,
+			});
+
+			const invalidBody = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+				method: "POST",
+				headers: { ...headers, "Content-Type": "application/json" },
+				body: JSON.stringify({}),
+			});
+			expect(invalidBody.status).toBe(400);
+
+			const unknownAgent = await fetch(`${baseUrl}/v1/agents/missing/runs`, {
+				method: "POST",
+				headers: { ...headers, "Content-Type": "application/json" },
+				body: JSON.stringify({ input: "hello" }),
+			});
+			expect(unknownAgent.status).toBe(404);
+
+			const createResponse = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+				method: "POST",
+				headers: { ...headers, "Content-Type": "application/json" },
+				body: JSON.stringify({ conversationId: "busy-conversation", input: "wait" }),
+			});
+			expect(createResponse.status).toBe(202);
+			const created = (await createResponse.json()) as { runId: string; statusUrl: string; eventsUrl: string };
+			const runtime = await factory.started;
+			await runtime.promptStarted;
+
+			const conflict = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+				method: "POST",
+				headers: { ...headers, "Content-Type": "application/json" },
+				body: JSON.stringify({ conversationId: "busy-conversation", input: "second request" }),
+			});
+			expect(conflict.status).toBe(409);
+
+			const abortResponse = await fetch(`${baseUrl}/v1/runs/${created.runId}/abort`, {
+				method: "POST",
+				headers,
+			});
+			expect(abortResponse.status).toBe(200);
+			const cancelled = await waitForRunStatus(baseUrl, created.statusUrl, headers, "cancelled");
+			expect(cancelled.status).toBe("cancelled");
+
+			const statusResponse = await fetch(`${baseUrl}${created.statusUrl}`, { headers });
+			expect(statusResponse.status).toBe(200);
+			const eventsResponse = await fetch(`${baseUrl}${created.eventsUrl}`, { headers });
+			expect(eventsResponse.status).toBe(200);
+			expect(await eventsResponse.text()).toContain("event: run_cancelled");
+
+			expect((await fetch(`${baseUrl}/v1/runs/missing`, { headers })).status).toBe(404);
+			expect((await fetch(`${baseUrl}/v1/runs/missing/events`, { headers })).status).toBe(404);
+			expect(
+				(
+					await fetch(`${baseUrl}/v1/runs/missing/abort`, {
+						method: "POST",
+						headers,
+					})
+				).status,
+			).toBe(404);
+		} finally {
+			await server.close();
+		}
+	}, 15_000);
+});
+
+describe.skipIf(!integrationEnabled)("pi-agent-server Gemma integration", () => {
+	test("routes a configured Gemma agent through HTTP, SSE, and persistent session storage", async () => {
+		const agentDir = process.env.PI_AGENT_DIR ?? getAgentDir();
+		const gemma = await findConfiguredGemma(agentDir);
+		const cwd = await makeTemporaryDirectory("pi-agent-server-cwd-");
+		const sessionDir = await makeTemporaryDirectory("pi-agent-server-sessions-");
+		const definition: AgentDefinition = {
+			id: "gemma-smoke",
+			cwd,
+			model: gemma,
+			thinkingLevel: "off",
+			systemPrompt: "You are an integration test agent. Reply with exactly INTEGRATION_TEST_OK and nothing else.",
+			tools: [],
+			persistent: true,
+			loadProjectResources: false,
+		};
+		const token = "pi-agent-server-integration-token";
+		const server = new AgentApiServer(
+			new AgentRegistry([definition]),
+			new CodingAgentRuntimeFactory({ sessionDir: join(sessionDir, "{agentid}", "session"), agentDir }),
+			{
+				host: "127.0.0.1",
+				port: 0,
+				authToken: token,
+				maxBodyBytes: 64 * 1024,
+				maxRunHistory: 20,
+				maxEventsPerRun: 2_000,
+			},
+		);
+
+		try {
+			await server.start();
+			const baseUrl = server.address;
+			if (!baseUrl) throw new Error("Server did not expose a listening address");
+			const headers = { Authorization: `Bearer ${token}` };
+
+			const healthResponse = await fetch(`${baseUrl}/healthz`);
+			expect(healthResponse.status).toBe(200);
+
+			expect((await fetch(`${baseUrl}/v1/agents`)).status).toBe(401);
+			const agentsResponse = await fetch(`${baseUrl}/v1/agents`, { headers });
+			expect(agentsResponse.status).toBe(200);
+			const agents = (await agentsResponse.json()) as {
+				agents: Array<{ id: string; model: { provider: string; id: string } }>;
+			};
+			expect(agents.agents).toContainEqual({
+				id: "gemma-smoke",
+				model: gemma,
+				thinkingLevel: "off",
+				tools: [],
+				persistent: true,
+			});
+
+			const createResponse = await fetch(`${baseUrl}/v1/agents/gemma-smoke/runs`, {
+				method: "POST",
+				headers: { ...headers, "Content-Type": "application/json" },
+				body: JSON.stringify({
+					conversationId: "gemma-integration",
+					input: "Reply with exactly INTEGRATION_TEST_OK.",
+				}),
+			});
+			expect(createResponse.status).toBe(202);
+			const created = (await createResponse.json()) as { runId: string; statusUrl: string; eventsUrl: string };
+
+			const eventsResponse = await fetch(`${baseUrl}${created.eventsUrl}`, { headers });
+			expect(eventsResponse.status).toBe(200);
+			const events = await eventsResponse.text();
+			expect(events).toContain("event: run_started");
+			expect(events).toContain("event: run_completed");
+
+			const statusResponse = await fetch(`${baseUrl}${created.statusUrl}`, { headers });
+			expect(statusResponse.status).toBe(200);
+			const snapshot = (await statusResponse.json()) as {
+				status: string;
+				conversationId: string;
+				result?: { output: string };
+			};
+			expect(snapshot.status).toBe("completed");
+			expect(snapshot.conversationId).toBe("gemma-integration");
+			expect(snapshot.result?.output).toContain("INTEGRATION_TEST_OK");
+
+			const agentSessionDirectory = join(sessionDir, "gemma-smoke", "session");
+			const sessionFiles = await readdir(agentSessionDirectory);
+			expect(sessionFiles).toContain("gemma-integration.jsonl");
+		} finally {
+			await server.close();
+		}
+	}, 120_000);
+});
+
+async function findConfiguredGemma(agentDir: string): Promise<GemmaModel> {
+	const [modelsContent, authContent] = await Promise.all([
+		readFile(join(agentDir, "models.json"), "utf8"),
+		readFile(join(agentDir, "auth.json"), "utf8"),
+	]);
+	const models = asRecord(JSON.parse(modelsContent) as unknown, "models.json");
+	const providers = asRecord(models.providers, "models.json.providers");
+	const auth = asRecord(JSON.parse(authContent) as unknown, "auth.json");
+	const preferredProviders = ["ai-hub-openai", "ai-hub-teams", "ai-hub"];
+	for (const providerId of preferredProviders) {
+		const provider = asRecord(providers[providerId], `models.json.providers.${providerId}`);
+		const configured = auth[providerId] !== undefined || typeof provider.apiKey === "string";
+		if (!configured || !Array.isArray(provider.models)) continue;
+		const model = provider.models.find(
+			(candidate): candidate is JsonRecord =>
+				isRecord(candidate) && typeof candidate.id === "string" && candidate.id.toLowerCase().includes("gemma"),
+		);
+		if (model) return { provider: providerId, id: model.id as string };
+	}
+	throw new Error(`No authenticated Gemma model found in ${join(homedir(), ".pi", "agent")}`);
+}
+
+async function makeTemporaryDirectory(prefix: string): Promise<string> {
+	const directory = await mkdtemp(join(tmpdir(), prefix));
+	temporaryDirectories.push(directory);
+	return directory;
+}
+
+async function waitForRunStatus(
+	baseUrl: string,
+	statusUrl: string,
+	headers: Record<string, string>,
+	expectedStatus: string,
+): Promise<{ status: string }> {
+	const deadline = Date.now() + 5_000;
+	for (;;) {
+		const response = await fetch(`${baseUrl}${statusUrl}`, { headers });
+		const snapshot = (await response.json()) as { status: string };
+		if (snapshot.status === expectedStatus) return snapshot;
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for run status ${expectedStatus}`);
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+function asRecord(value: unknown, description: string): JsonRecord {
+	if (!isRecord(value)) throw new Error(`${description} must be an object`);
+	return value;
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
