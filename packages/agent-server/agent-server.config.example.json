@@ -1,0 +1,43 @@
+{
+	"host": "127.0.0.1",
+	"port": 8787,
+	"sessionDir": "~/.pi/agent-server-/{agentid}/session",
+	"agents": {
+		"code-review": {
+			"cwd": "/srv/workspaces/project",
+			"model": {
+				"provider": "ai-hub",
+				"id": "claude-sonnet"
+			},
+			"thinkingLevel": "high",
+			"systemPrompt": "You are a strict code reviewer. Report concrete defects, risks, and actionable fixes.",
+			"tools": ["read", "grep", "find"],
+			"persistent": true,
+			"loadProjectResources": false
+		},
+		"coding": {
+			"cwd": "/srv/workspaces/project",
+			"model": {
+				"provider": "ai-hub-openai",
+				"id": "gpt-5-codex"
+			},
+			"thinkingLevel": "high",
+			"systemPrompt": "You are an implementation agent. Make focused, safe changes and verify your work.",
+			"tools": ["read", "grep", "find", "edit", "write", "bash"],
+			"persistent": true,
+			"loadProjectResources": false
+		},
+		"documentation": {
+			"cwd": "/srv/workspaces/project",
+			"model": {
+				"provider": "ai-hub-teams",
+				"id": "gpt-5-mini"
+			},
+			"thinkingLevel": "medium",
+			"systemPrompt": "You write concise technical documentation based on the files you inspect.",
+			"tools": ["read", "grep", "find", "write"],
+			"persistent": true,
+			"loadProjectResources": false
+		}
+	}
+}

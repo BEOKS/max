@@ -1,0 +1,27 @@
+{
+	"name": "@earendil-works/pi-agent-server",
+	"version": "0.0.0",
+	"private": true,
+	"description": "HTTP server for running multiple configured pi coding agents",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"bin": {
+		"pi-agent-server": "./dist/main.js"
+	},
+	"scripts": {
+		"build": "tsgo -p tsconfig.build.json",
+		"clean": "shx rm -rf dist",
+		"start": "node dist/main.js",
+		"dev": "tsx src/main.ts"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "^0.84.3",
+		"@earendil-works/pi-ai": "^0.84.3",
+		"@earendil-works/pi-coding-agent": "^0.84.3"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"shx": "0.4.0"
+	}
+}
