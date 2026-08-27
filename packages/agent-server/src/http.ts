@@ -1,9 +1,11 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AgentAuthService, AgentPrincipal } from "./auth.ts";
 import { AgentServerError } from "./errors.ts";
 import { type AgentRegistry, isSafeIdentifier } from "./registry.ts";
 import { AgentRunManager } from "./runs.ts";
 import type { AgentRunEvent, AgentRunRequest, AgentRuntimeFactory } from "./types.ts";
+import { renderAgentWebPage } from "./web.ts";
 
 const INTERNAL_ERROR_MESSAGE = "Internal server error";
 
@@ -11,6 +13,7 @@ export interface AgentApiServerOptions {
 	host: string;
 	port: number;
 	authToken?: string;
+	hiworksAuth?: AgentAuthService;
 	maxBodyBytes: number;
 	maxRunHistory: number;
 	maxEventsPerRun: number;
@@ -121,11 +124,77 @@ export class AgentApiServer {
 		}
 
 		if (this.#closing) throw new HttpError(503, "server_closing", "Server is shutting down");
+		if (pathname === "/" || pathname === "/index.html") {
+			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const principal = await this.#authenticate(request);
+			if (this.#options.hiworksAuth && (!principal || principal.source === "anonymous")) {
+				response.writeHead(302, {
+					Location: "/auth/hiworks/login",
+					"Cache-Control": "no-store",
+				});
+				response.end();
+				return;
+			}
+			if (!principal && this.#options.authToken) {
+				response.setHeader("WWW-Authenticate", "Bearer");
+				throw new HttpError(401, "unauthorized", "Authentication required");
+			}
+			writeHtml(response, 200, renderAgentWebPage());
+			return;
+		}
 
-		if (!this.#isAuthorized(request)) {
-			response.setHeader("WWW-Authenticate", "Bearer");
+		if (pathname === "/auth/me") {
+			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const principal = await this.#authenticate(request);
+			writeJson(response, 200, {
+				authenticated: principal !== undefined && principal.source !== "anonymous",
+				user: principal && principal.source !== "anonymous" ? publicPrincipal(principal) : null,
+			});
+			return;
+		}
+
+		if (pathname === "/auth/hiworks/login") {
+			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const auth = this.#requireHiworksAuth();
+			const login = auth.startLogin();
+			response.writeHead(302, {
+				Location: login.location,
+				"Cache-Control": "no-store",
+				"Set-Cookie": login.setCookie,
+			});
+			response.end();
+			return;
+		}
+
+		if (this.#options.hiworksAuth?.callbackPath === pathname) {
+			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const auth = this.#requireHiworksAuth();
+			const callbackUrl = new URL(request.url ?? "/", "http://localhost");
+			const completion = await auth.completeLogin(callbackUrl, request.headers.cookie);
+			response.writeHead(303, {
+				Location: "/",
+				"Cache-Control": "no-store",
+				"Referrer-Policy": "no-referrer",
+				"Set-Cookie": [...completion.setCookies],
+			});
+			response.end();
+			return;
+		}
+
+		if (pathname === "/auth/hiworks/logout") {
+			if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const auth = this.#requireHiworksAuth();
+			response.setHeader("Set-Cookie", auth.logout(request.headers.cookie));
+			writeJson(response, 200, { ok: true });
+			return;
+		}
+
+		const principal = await this.#authenticate(request);
+		if (!principal) {
+			if (this.#options.authToken) response.setHeader("WWW-Authenticate", "Bearer");
 			throw new HttpError(401, "unauthorized", "Authentication required");
 		}
+		const ownerId = principal.source === "hiworks" ? principal.id : undefined;
 
 		const parts = pathname
 			.split("/")
@@ -140,7 +209,7 @@ export class AgentApiServer {
 		if (parts.length === 4 && parts[0] === "v1" && parts[1] === "agents" && parts[3] === "runs") {
 			if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
 			const body = await readRunRequest(request, this.#options.maxBodyBytes);
-			const snapshot = this.#runs.create(parts[2], body);
+			const snapshot = this.#runs.create(parts[2], body, ownerId);
 			writeJson(response, 202, {
 				runId: snapshot.id,
 				agentId: snapshot.agentId,
@@ -154,19 +223,19 @@ export class AgentApiServer {
 
 		if (parts.length === 3 && parts[0] === "v1" && parts[1] === "runs") {
 			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-			writeJson(response, 200, this.#runs.get(parts[2]));
+			writeJson(response, 200, this.#runs.get(parts[2], ownerId, principal.admin));
 			return;
 		}
 
 		if (parts.length === 4 && parts[0] === "v1" && parts[1] === "runs" && parts[3] === "events") {
 			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-			this.#streamEvents(response, parts[2]);
+			this.#streamEvents(response, parts[2], ownerId, principal.admin);
 			return;
 		}
 
 		if (parts.length === 4 && parts[0] === "v1" && parts[1] === "runs" && parts[3] === "abort") {
 			if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-			writeJson(response, 200, await this.#runs.abort(parts[2]));
+			writeJson(response, 200, await this.#runs.abort(parts[2], ownerId, principal.admin));
 			return;
 		}
 
@@ -177,8 +246,8 @@ export class AgentApiServer {
 		return this.#registry.publicMetadata();
 	}
 
-	#streamEvents(response: ServerResponse, runId: string): void {
-		this.#runs.get(runId);
+	#streamEvents(response: ServerResponse, runId: string, ownerId: string | undefined, isAdmin: boolean): void {
+		this.#runs.get(runId, ownerId, isAdmin);
 		response.writeHead(200, {
 			"Content-Type": "text/event-stream; charset=utf-8",
 			"Cache-Control": "no-cache, no-transform",
@@ -206,7 +275,7 @@ export class AgentApiServer {
 			}
 		};
 
-		unsubscribe = this.#runs.subscribe(runId, onEvent);
+		unsubscribe = this.#runs.subscribe(runId, onEvent, ownerId, isAdmin);
 		response.once("close", () => {
 			active = false;
 			unsubscribe();
@@ -229,13 +298,34 @@ export class AgentApiServer {
 		}
 	}
 
-	#isAuthorized(request: IncomingMessage): boolean {
-		if (!this.#options.authToken) return true;
+	#isServerTokenAuthorized(request: IncomingMessage): boolean {
+		if (!this.#options.authToken) return false;
 		const authorization = request.headers.authorization;
 		if (!authorization?.startsWith("Bearer ")) return false;
 		const received = Buffer.from(authorization.slice("Bearer ".length));
 		const expected = Buffer.from(this.#options.authToken);
 		return received.length === expected.length && timingSafeEqual(received, expected);
+	}
+
+	async #authenticate(request: IncomingMessage): Promise<AgentPrincipal | undefined> {
+		if (this.#isServerTokenAuthorized(request)) {
+			return { id: "server-token", source: "server_token", admin: true };
+		}
+		const auth = this.#options.hiworksAuth;
+		if (auth) {
+			const principal = await auth.authenticate(request.headers.cookie);
+			if (principal) return principal;
+		}
+		if (!this.#options.authToken && !auth) {
+			return { id: "anonymous", source: "anonymous", admin: false };
+		}
+		return undefined;
+	}
+
+	#requireHiworksAuth(): AgentAuthService {
+		const auth = this.#options.hiworksAuth;
+		if (!auth) throw new HttpError(404, "auth_not_configured", "Hiworks authentication is not configured");
+		return auth;
 	}
 
 	#handleError(response: ServerResponse, error: unknown): void {
@@ -258,6 +348,36 @@ export class AgentApiServer {
 			// Diagnostics cannot affect the HTTP server.
 		}
 	}
+}
+
+function publicPrincipal(principal: AgentPrincipal): {
+	id: string;
+	source: AgentPrincipal["source"];
+	admin: boolean;
+	profile?: AgentPrincipal["profile"];
+	email?: string;
+	displayName?: string;
+} {
+	return {
+		id: principal.id,
+		source: principal.source,
+		admin: principal.admin,
+		...(principal.profile ? { profile: principal.profile } : {}),
+		...(principal.email ? { email: principal.email } : {}),
+		...(principal.displayName ? { displayName: principal.displayName } : {}),
+	};
+}
+
+function writeHtml(response: ServerResponse, statusCode: number, html: string): void {
+	response.writeHead(statusCode, {
+		"Content-Type": "text/html; charset=utf-8",
+		"Cache-Control": "no-store",
+		"Content-Security-Policy":
+			"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+		"Referrer-Policy": "no-referrer",
+		"X-Content-Type-Options": "nosniff",
+	});
+	response.end(html);
 }
 
 function writeJson(response: ServerResponse, statusCode: number, value: unknown): void {

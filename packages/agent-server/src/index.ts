@@ -1,4 +1,21 @@
-export { type AgentServerConfig, isLoopbackHost, loadAgentServerConfig, parsePort } from "./config.ts";
+export {
+	type AgentAuthService,
+	type AgentPrincipal,
+	HIWORKS_SESSION_COOKIE,
+	HIWORKS_STATE_COOKIE,
+	HiworksAuthFlowError,
+	HiworksAuthService,
+	type HiworksAuthServiceOptions,
+	type HiworksLoginCompletion,
+	type HiworksLoginStart,
+} from "./auth.ts";
+export {
+	type AgentServerConfig,
+	type HiworksServerConfig,
+	isLoopbackHost,
+	loadAgentServerConfig,
+	parsePort,
+} from "./config.ts";
 export * from "./errors.ts";
 export { AgentApiServer, type AgentApiServerOptions } from "./http.ts";
 export { AgentRegistry, assertSafeIdentifier, isSafeIdentifier } from "./registry.ts";

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -36,7 +37,7 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 		}
 	}
 
-	async create(definition: AgentDefinition, conversationId: string): Promise<AgentRuntime> {
+	async create(definition: AgentDefinition, conversationId: string, ownerId?: string): Promise<AgentRuntime> {
 		const modelRuntime = await this.#getModelRuntime();
 		const model = modelRuntime.getModel(definition.model.provider, definition.model.id);
 		if (!model) {
@@ -59,7 +60,7 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 		});
 		await resourceLoader.reload();
 
-		const sessionManager = await this.#createSessionManager(definition, conversationId);
+		const sessionManager = await this.#createSessionManager(definition, conversationId, ownerId);
 		const created = await createAgentSession({
 			cwd: definition.cwd,
 			agentDir: this.#agentDir,
@@ -102,13 +103,24 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 		}
 	}
 
-	async #createSessionManager(definition: AgentDefinition, conversationId: string): Promise<SessionManager> {
+	async #createSessionManager(
+		definition: AgentDefinition,
+		conversationId: string,
+		ownerId?: string,
+	): Promise<SessionManager> {
 		if (!definition.persistent) return SessionManager.inMemory(definition.cwd);
-		const agentSessionDir = resolveAgentSessionDir(this.#sessionDir, definition.id);
+		const agentSessionDir = resolveUserSessionDir(this.#sessionDir, definition.id, ownerId);
 		await mkdir(agentSessionDir, { recursive: true });
 		const sessionPath = join(agentSessionDir, `${conversationId}.jsonl`);
 		return SessionManager.open(sessionPath, agentSessionDir, definition.cwd);
 	}
+}
+
+function resolveUserSessionDir(template: string, agentId: string, ownerId: string | undefined): string {
+	const agentSessionDir = resolveAgentSessionDir(template, agentId);
+	if (!ownerId) return agentSessionDir;
+	const ownerDirectory = createHash("sha256").update(ownerId).digest("hex").slice(0, 32);
+	return join(agentSessionDir, ownerDirectory);
 }
 
 function resolveAgentSessionDir(template: string, agentId: string): string {

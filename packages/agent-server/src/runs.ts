@@ -17,6 +17,7 @@ interface RunRecord {
 	snapshot: AgentRunSnapshot;
 	definition: AgentDefinition;
 	input: string;
+	ownerId?: string;
 	events: AgentRunEvent[];
 	subscribers: Set<(event: AgentRunEvent) => void>;
 	cancelRequested: boolean;
@@ -48,12 +49,12 @@ export class AgentRunManager {
 		this.#onError = options.onError;
 	}
 
-	create(agentId: string, request: AgentRunRequest): AgentRunSnapshot {
+	create(agentId: string, request: AgentRunRequest, ownerId?: string): AgentRunSnapshot {
 		if (this.#closing) throw new Error("Agent run manager is closing");
 		const definition = this.#registry.require(agentId);
 		const conversationId = request.conversationId ?? randomUUID();
 		if (!isSafeIdentifier(conversationId)) throw new Error("conversationId contains unsupported characters");
-		const conversationKey = `${agentId}\0${conversationId}`;
+		const conversationKey = makeConversationKey(ownerId, agentId, conversationId);
 		const activeRunId = this.#activeConversations.get(conversationKey);
 		if (activeRunId) throw new AgentRunConflictError(activeRunId, conversationId);
 
@@ -69,6 +70,7 @@ export class AgentRunManager {
 			snapshot,
 			definition,
 			input: request.input,
+			...(ownerId ? { ownerId } : {}),
 			events: [],
 			subscribers: new Set(),
 			cancelRequested: false,
@@ -79,20 +81,20 @@ export class AgentRunManager {
 		return this.#copySnapshot(record.snapshot);
 	}
 
-	get(runId: string): AgentRunSnapshot {
-		return this.#copySnapshot(this.#require(runId).snapshot);
+	get(runId: string, ownerId?: string, isAdmin = false): AgentRunSnapshot {
+		return this.#copySnapshot(this.#requireOwned(runId, ownerId, isAdmin).snapshot);
 	}
 
-	subscribe(runId: string, listener: (event: AgentRunEvent) => void): () => void {
-		const record = this.#require(runId);
+	subscribe(runId: string, listener: (event: AgentRunEvent) => void, ownerId?: string, isAdmin = false): () => void {
+		const record = this.#requireOwned(runId, ownerId, isAdmin);
 		for (const event of record.events) listener(event);
 		if (isTerminalStatus(record.snapshot.status)) return () => {};
 		record.subscribers.add(listener);
 		return () => record.subscribers.delete(listener);
 	}
 
-	async abort(runId: string): Promise<AgentRunSnapshot> {
-		const record = this.#require(runId);
+	async abort(runId: string, ownerId?: string, isAdmin = false): Promise<AgentRunSnapshot> {
+		const record = this.#requireOwned(runId, ownerId, isAdmin);
 		if (isTerminalStatus(record.snapshot.status)) return this.#copySnapshot(record.snapshot);
 		record.cancelRequested = true;
 		if (record.runtime) await record.runtime.abort();
@@ -129,7 +131,7 @@ export class AgentRunManager {
 				return;
 			}
 
-			const runtime = await this.#factory.create(record.definition, record.snapshot.conversationId);
+			const runtime = await this.#factory.create(record.definition, record.snapshot.conversationId, record.ownerId);
 			record.runtime = runtime;
 			unsubscribe = runtime.subscribe((event) => {
 				this.#publish(record, {
@@ -226,6 +228,12 @@ export class AgentRunManager {
 		return record;
 	}
 
+	#requireOwned(runId: string, ownerId: string | undefined, isAdmin: boolean): RunRecord {
+		const record = this.#require(runId);
+		if (!isAdmin && record.ownerId !== ownerId) throw new AgentRunNotFoundError(runId);
+		return record;
+	}
+
 	#copySnapshot(snapshot: AgentRunSnapshot): AgentRunSnapshot {
 		return {
 			...snapshot,
@@ -256,6 +264,10 @@ export class AgentRunManager {
 			// Diagnostics cannot affect a run.
 		}
 	}
+}
+
+function makeConversationKey(ownerId: string | undefined, agentId: string, conversationId: string): string {
+	return JSON.stringify([ownerId ?? null, agentId, conversationId]);
 }
 
 function isAssistantMessage(message: AgentRunResult["messages"][number]): message is AssistantMessage {

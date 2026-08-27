@@ -37,7 +37,7 @@ export interface AgentRuntime {
 
 export interface AgentRuntimeFactory {
 	prepare(definitions: readonly AgentDefinition[]): Promise<void>;
-	create(definition: AgentDefinition, conversationId: string): Promise<AgentRuntime>;
+	create(definition: AgentDefinition, conversationId: string, ownerId?: string): Promise<AgentRuntime>;
 }
 
 export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";

@@ -3,6 +3,13 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test } from "vitest";
+import {
+	type AgentAuthService,
+	type AgentPrincipal,
+	HiworksAuthService,
+	type HiworksLoginCompletion,
+	type HiworksLoginStart,
+} from "../src/auth.ts";
 import { AgentApiServer } from "../src/http.ts";
 import { AgentRegistry } from "../src/registry.ts";
 import { CodingAgentRuntimeFactory } from "../src/runtime.ts";
@@ -184,7 +191,196 @@ describe("pi-agent-server HTTP integration", () => {
 			await server.close();
 		}
 	}, 15_000);
+
+	test("isolates runs and conversations between Hiworks users", async () => {
+		const factory = new BlockingRuntimeFactory();
+		const server = new AgentApiServer(new AgentRegistry([fakeDefinition]), factory, {
+			host: "127.0.0.1",
+			port: 0,
+			hiworksAuth: new TestCookieAuthService(),
+			maxBodyBytes: 64 * 1024,
+			maxRunHistory: 20,
+			maxEventsPerRun: 100,
+		});
+
+		try {
+			await server.start();
+			const baseUrl = server.address;
+			if (!baseUrl) throw new Error("Server did not expose a listening address");
+			const userAHeaders = { Cookie: "pi_agent_session=user-a" };
+			const userBHeaders = { Cookie: "pi_agent_session=user-b" };
+
+			expect((await fetch(`${baseUrl}/v1/agents`)).status).toBe(401);
+			const runAResponse = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+				method: "POST",
+				headers: { ...userAHeaders, "Content-Type": "application/json" },
+				body: JSON.stringify({ conversationId: "shared-name", input: "user A" }),
+			});
+			const runA = (await runAResponse.json()) as { runId: string };
+			expect(runAResponse.status).toBe(202);
+
+			const sameConversationForB = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+				method: "POST",
+				headers: { ...userBHeaders, "Content-Type": "application/json" },
+				body: JSON.stringify({ conversationId: "shared-name", input: "user B" }),
+			});
+			const runB = (await sameConversationForB.json()) as { runId: string };
+			expect(sameConversationForB.status).toBe(202);
+
+			const sameConversationForA = await fetch(`${baseUrl}/v1/agents/fake-agent/runs`, {
+				method: "POST",
+				headers: { ...userAHeaders, "Content-Type": "application/json" },
+				body: JSON.stringify({ conversationId: "shared-name", input: "user A again" }),
+			});
+			expect(sameConversationForA.status).toBe(409);
+
+			expect((await fetch(`${baseUrl}/v1/runs/${runA.runId}`, { headers: userBHeaders })).status).toBe(404);
+			expect(
+				(
+					await fetch(`${baseUrl}/v1/runs/${runA.runId}/abort`, {
+						method: "POST",
+						headers: userBHeaders,
+					})
+				).status,
+			).toBe(404);
+
+			const abortA = await fetch(`${baseUrl}/v1/runs/${runA.runId}/abort`, {
+				method: "POST",
+				headers: userAHeaders,
+			});
+			const abortB = await fetch(`${baseUrl}/v1/runs/${runB.runId}/abort`, {
+				method: "POST",
+				headers: userBHeaders,
+			});
+			expect(abortA.status).toBe(200);
+			expect(abortB.status).toBe(200);
+			expect((await waitForRunStatus(baseUrl, `/v1/runs/${runA.runId}`, userAHeaders, "cancelled")).status).toBe(
+				"cancelled",
+			);
+			expect((await waitForRunStatus(baseUrl, `/v1/runs/${runB.runId}`, userBHeaders, "cancelled")).status).toBe(
+				"cancelled",
+			);
+		} finally {
+			await server.close();
+		}
+	}, 15_000);
+
+	test("supports Hiworks login, current-user, and logout routes", async () => {
+		const auth = new HiworksAuthService({
+			profile: "gabia",
+			publicBaseUrl: "http://127.0.0.1:8787",
+			callbackPath: "/auth/hiworks/callback",
+			scope: "read",
+			sessionTtlMs: 60_000,
+			pendingTtlMs: 10_000,
+			exchangeCodeForToken: async () => ({
+				access_token: "route-access-token",
+				token_type: "Bearer",
+				expires_in: 3_600,
+				refresh_token: "route-refresh-token",
+			}),
+			fetchMe: async (accessToken) => {
+				expect(accessToken).toBe("route-access-token");
+				return { user_no: "route-user", email: "route@example.com" };
+			},
+		});
+		const server = new AgentApiServer(new AgentRegistry([fakeDefinition]), new BlockingRuntimeFactory(), {
+			host: "127.0.0.1",
+			port: 0,
+			hiworksAuth: auth,
+			maxBodyBytes: 64 * 1024,
+			maxRunHistory: 20,
+			maxEventsPerRun: 100,
+		});
+
+		try {
+			await server.start();
+			const baseUrl = server.address;
+			if (!baseUrl) throw new Error("Server did not expose a listening address");
+
+			const anonymousMe = await fetch(`${baseUrl}/auth/me`);
+			expect(anonymousMe.status).toBe(200);
+			expect(await anonymousMe.json()).toEqual({ authenticated: false, user: null });
+			const anonymousHome = await fetch(`${baseUrl}/`, { redirect: "manual" });
+			expect(anonymousHome.status).toBe(302);
+			expect(anonymousHome.headers.get("location")).toBe("/auth/hiworks/login");
+
+			const login = await fetch(`${baseUrl}/auth/hiworks/login`, { redirect: "manual" });
+			expect(login.status).toBe(302);
+			const loginLocation = login.headers.get("location");
+			const state = loginLocation ? new URL(loginLocation).searchParams.get("state") : undefined;
+			if (!state) throw new Error("Hiworks login route did not return state");
+			const stateCookie = cookieValueFromHeader(login.headers.get("set-cookie"), "pi_agent_oauth_state");
+			expect(stateCookie).toBe(state);
+
+			const callback = await fetch(
+				`${baseUrl}/auth/hiworks/callback?code=route-code&state=${encodeURIComponent(state)}`,
+				{ headers: { Cookie: `pi_agent_oauth_state=${stateCookie}` }, redirect: "manual" },
+			);
+			expect(callback.status).toBe(303);
+			expect(callback.headers.get("location")).toBe("/");
+			const sessionCookie = cookieValueFromHeader(callback.headers.get("set-cookie"), "pi_agent_session");
+			const home = await fetch(`${baseUrl}/`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } });
+			expect(home.status).toBe(200);
+			expect(await home.text()).toContain("PI / AGENT CONTROL");
+
+			const me = await fetch(`${baseUrl}/auth/me`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } });
+			expect(me.status).toBe(200);
+			expect(await me.json()).toEqual({
+				authenticated: true,
+				user: {
+					id: "hiworks:gabia:route-user",
+					source: "hiworks",
+					admin: false,
+					profile: "gabia",
+					email: "route@example.com",
+				},
+			});
+			expect(
+				(await fetch(`${baseUrl}/v1/agents`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } })).status,
+			).toBe(200);
+
+			const logout = await fetch(`${baseUrl}/auth/hiworks/logout`, {
+				method: "POST",
+				headers: { Cookie: `pi_agent_session=${sessionCookie}` },
+			});
+			expect(logout.status).toBe(200);
+			expect(
+				(await fetch(`${baseUrl}/v1/agents`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } })).status,
+			).toBe(401);
+		} finally {
+			await server.close();
+		}
+	}, 15_000);
 });
+
+class TestCookieAuthService implements AgentAuthService {
+	readonly callbackPath = "/auth/hiworks/callback";
+	readonly #principals = new Map<string, AgentPrincipal>([
+		["user-a", { id: "hiworks:gabia:user-a", source: "hiworks", profile: "gabia", admin: false }],
+		["user-b", { id: "hiworks:gabia:user-b", source: "hiworks", profile: "gabia", admin: false }],
+	]);
+
+	async authenticate(cookieHeader?: string): Promise<AgentPrincipal | undefined> {
+		const cookie = cookieHeader
+			?.split(";")
+			.map((part) => part.trim())
+			.find((part) => part.startsWith("pi_agent_session="));
+		return cookie ? this.#principals.get(cookie.slice("pi_agent_session=".length)) : undefined;
+	}
+
+	startLogin(): HiworksLoginStart {
+		return { location: "https://hiworks.example.test/login", setCookie: "pi_agent_oauth_state=test" };
+	}
+
+	async completeLogin(): Promise<HiworksLoginCompletion> {
+		throw new Error("Not used in this test");
+	}
+
+	logout(): string {
+		return "pi_agent_session=; Max-Age=0; Path=/";
+	}
+}
 
 describe.skipIf(!integrationEnabled)("pi-agent-server Gemma integration", () => {
 	test("routes a configured Gemma agent through HTTP, SSE, and persistent session storage", async () => {
@@ -327,4 +523,10 @@ function asRecord(value: unknown, description: string): JsonRecord {
 
 function isRecord(value: unknown): value is JsonRecord {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function cookieValueFromHeader(header: string | null, name: string): string {
+	const match = header?.match(new RegExp(`${name}=([^;,]+)`, "u"));
+	if (!match?.[1]) throw new Error(`Cookie ${name} was not set`);
+	return match[1];
 }
