@@ -177,7 +177,7 @@ describe("OpenAI Codex OAuth", () => {
 		expect(pollTimes).toEqual([startTime.getTime(), startTime.getTime() + 5000]);
 	});
 
-	it("offers browser login first and uses the selected OpenAI Codex device code flow", async () => {
+	it("offers device-code login first and uses the selected OpenAI Codex device code flow", async () => {
 		const accessToken = createAccessToken("account-456");
 		const selectPrompts: Array<{
 			message: string;
@@ -248,8 +248,8 @@ describe("OpenAI Codex OAuth", () => {
 				type: "select",
 				message: "Select OpenAI Codex login method:",
 				options: [
-					{ id: "browser", label: "Browser login (default)" },
-					{ id: "device_code", label: "Device code login (headless)" },
+					{ id: "device_code", label: "Device code login (default)" },
+					{ id: "browser", label: "Browser login" },
 				],
 			},
 		]);

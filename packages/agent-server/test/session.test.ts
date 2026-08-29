@@ -19,7 +19,7 @@ describe("CodingAgentRuntimeFactory session inspection", () => {
 	test("reads the complete session in the authenticated user's namespace", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "pi-agent-server-session-test-"));
 		temporaryDirectories.push(directory);
-		const ownerId = "hiworks:gabia:user-a";
+		const ownerId = "codex:user-a";
 		const sessionId = "session-a";
 		const definition: AgentDefinition = {
 			id: "history-agent",
@@ -65,6 +65,6 @@ describe("CodingAgentRuntimeFactory session inspection", () => {
 		expect(snapshot?.entries).toHaveLength(2);
 		expect(snapshot?.tree).toHaveLength(1);
 		expect(snapshot?.context.messages).toHaveLength(2);
-		expect(await factory.readSession(definition, sessionId, "hiworks:gabia:user-b")).toBeUndefined();
+		expect(await factory.readSession(definition, sessionId, "codex:user-b")).toBeUndefined();
 	});
 });

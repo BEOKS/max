@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import { access, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import type { CredentialStore } from "@earendil-works/pi-ai";
 import {
+	AuthStorage,
 	createAgentSession,
 	DefaultResourceLoader,
 	ModelRuntime,
@@ -14,16 +16,21 @@ import type { AgentDefinition, AgentRuntime, AgentRuntimeFactory, AgentSessionSn
 export interface CodingAgentRuntimeFactoryOptions {
 	agentDir: string;
 	sessionDir: string;
+	credentialsForOwner?: (ownerId: string, fallback: CredentialStore) => CredentialStore;
 }
 
 export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 	readonly #agentDir: string;
 	readonly #sessionDir: string;
-	#modelRuntimePromise: Promise<ModelRuntime> | undefined;
+	readonly #credentialsForOwner: CodingAgentRuntimeFactoryOptions["credentialsForOwner"];
+	readonly #fallbackCredentials: CredentialStore;
+	readonly #modelRuntimePromises = new Map<string, Promise<ModelRuntime>>();
 
 	constructor(options: CodingAgentRuntimeFactoryOptions) {
 		this.#agentDir = resolve(options.agentDir);
 		this.#sessionDir = options.sessionDir;
+		this.#credentialsForOwner = options.credentialsForOwner;
+		this.#fallbackCredentials = AuthStorage.create(join(this.#agentDir, "auth.json"));
 	}
 
 	async prepare(definitions: readonly AgentDefinition[]): Promise<void> {
@@ -38,7 +45,7 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 	}
 
 	async create(definition: AgentDefinition, sessionId: string, ownerId?: string): Promise<AgentRuntime> {
-		const modelRuntime = await this.#getModelRuntime();
+		const modelRuntime = await this.#getModelRuntime(ownerId);
 		const model = modelRuntime.getModel(definition.model.provider, definition.model.id);
 		if (!model) {
 			throw new Error(
@@ -112,20 +119,25 @@ export class CodingAgentRuntimeFactory implements AgentRuntimeFactory {
 		};
 	}
 
-	async #getModelRuntime(): Promise<ModelRuntime> {
-		const existing = this.#modelRuntimePromise;
+	async #getModelRuntime(ownerId?: string): Promise<ModelRuntime> {
+		const key = ownerId ?? "__server__";
+		const existing = this.#modelRuntimePromises.get(key);
 		if (existing) return existing;
+		const credentials =
+			ownerId && this.#credentialsForOwner
+				? this.#credentialsForOwner(ownerId, this.#fallbackCredentials)
+				: this.#fallbackCredentials;
 		const promise = ModelRuntime.create({
-			authPath: join(this.#agentDir, "auth.json"),
+			credentials,
 			modelsPath: join(this.#agentDir, "models.json"),
 			allowModelNetwork: false,
 			refreshOnCreate: false,
 		});
-		this.#modelRuntimePromise = promise;
+		this.#modelRuntimePromises.set(key, promise);
 		try {
 			return await promise;
 		} catch (error) {
-			if (this.#modelRuntimePromise === promise) this.#modelRuntimePromise = undefined;
+			if (this.#modelRuntimePromises.get(key) === promise) this.#modelRuntimePromises.delete(key);
 			throw error;
 		}
 	}

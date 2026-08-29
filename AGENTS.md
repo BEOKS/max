@@ -1,5 +1,10 @@
 # Development Rules
 
+## Project Philosophy
+
+- Minimize by default: prefer less over more. Include only what is necessary; if something is not required, leave it out.
+- For direct user-facing use, keep each screen focused on one clear purpose and expose only the minimum functionality needed for that purpose. Do not add extra features or controls unless they are necessary for that purpose.
+
 ## Conversational Style
 
 - Keep answers short and concise

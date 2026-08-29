@@ -2,21 +2,8 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { PROFILES, type ProfileName } from "hiworks-browser-auth";
 import { assertSafeIdentifier } from "./registry.ts";
 import type { AgentDefinition, AgentModelReference } from "./types.ts";
-
-export interface HiworksServerConfig {
-	profile: ProfileName;
-	publicBaseUrl: string;
-	redirectUri?: string;
-	callbackPath: string;
-	scope: string;
-	clientId?: string;
-	clientSecret?: string;
-	sessionTtlMs: number;
-	pendingTtlMs: number;
-}
 
 export interface AgentServerConfig {
 	host: string;
@@ -24,10 +11,13 @@ export interface AgentServerConfig {
 	authToken?: string;
 	agentDir: string;
 	sessionDir: string;
+	authFile: string;
+	authSessionTtlMs: number;
+	authPendingTtlMs: number;
+	secureCookies: boolean;
 	maxBodyBytes: number;
 	maxRunHistory: number;
 	maxEventsPerRun: number;
-	hiworks?: HiworksServerConfig;
 	agents: readonly AgentDefinition[];
 }
 
@@ -103,78 +93,6 @@ function parseAgent(id: string, value: unknown): AgentDefinition {
 	};
 }
 
-function parseProfile(value: unknown, path: string): ProfileName {
-	const profile = value === undefined ? "gabia" : value;
-	if (profile !== "gabia" && profile !== "dev") throw new Error(`${path} must be one of gabia, dev`);
-	return profile;
-}
-
-function parsePublicBaseUrl(value: string, path: string): string {
-	let parsed: URL;
-	try {
-		parsed = new URL(value);
-	} catch {
-		throw new Error(`${path} must be a valid HTTP(S) URL`);
-	}
-	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-		throw new Error(`${path} must use http or https`);
-	}
-	if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-		throw new Error(`${path} must not contain credentials, query, or fragment`);
-	}
-	return parsed.toString().replace(/\/$/u, "");
-}
-
-function parseRedirectUri(value: string, path: string, callbackPath: string): string {
-	let parsed: URL;
-	try {
-		parsed = new URL(value);
-	} catch {
-		throw new Error(`${path} must be a valid HTTP(S) URL`);
-	}
-	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-		throw new Error(`${path} must use http or https`);
-	}
-	if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-		throw new Error(`${path} must not contain credentials, query, or fragment`);
-	}
-	if (parsed.pathname !== callbackPath) throw new Error(`${path} pathname must match hiworks.callbackPath`);
-	return parsed.toString();
-}
-
-function parseHiworks(value: unknown): HiworksServerConfig | undefined {
-	if (value === undefined) return undefined;
-	const hiworks = asRecord(value, "hiworks");
-	const callbackPath =
-		hiworks.callbackPath === undefined
-			? "/auth/hiworks/callback"
-			: requiredString(hiworks.callbackPath, "hiworks.callbackPath");
-	if (!callbackPath.startsWith("/") || callbackPath.includes("?") || callbackPath.includes("#")) {
-		throw new Error("hiworks.callbackPath must be an absolute path without a query or fragment");
-	}
-	const scope = hiworks.scope === undefined ? "read write" : requiredString(hiworks.scope, "hiworks.scope");
-	const profile = parseProfile(hiworks.profile, "hiworks.profile");
-	const clientId = optionalString(hiworks.clientId, "hiworks.clientId");
-	const clientSecret = optionalString(hiworks.clientSecret, "hiworks.clientSecret");
-	const publicBaseUrl = parsePublicBaseUrl(
-		requiredString(hiworks.publicBaseUrl, "hiworks.publicBaseUrl"),
-		"hiworks.publicBaseUrl",
-	);
-	const redirectUri = optionalString(hiworks.redirectUri, "hiworks.redirectUri");
-	if (!PROFILES[profile]) throw new Error(`Unknown Hiworks profile: ${profile}`);
-	return {
-		profile,
-		publicBaseUrl,
-		...(redirectUri ? { redirectUri: parseRedirectUri(redirectUri, "hiworks.redirectUri", callbackPath) } : {}),
-		callbackPath,
-		scope,
-		...(clientId ? { clientId } : {}),
-		...(clientSecret ? { clientSecret } : {}),
-		sessionTtlMs: integer(hiworks.sessionTtlMs, "hiworks.sessionTtlMs", 86_400_000, 1),
-		pendingTtlMs: integer(hiworks.pendingTtlMs, "hiworks.pendingTtlMs", 600_000, 1),
-	};
-}
-
 export async function loadAgentServerConfig(path: string): Promise<AgentServerConfig> {
 	const content = await readFile(path, "utf8");
 	let raw: unknown;
@@ -195,7 +113,7 @@ export async function loadAgentServerConfig(path: string): Promise<AgentServerCo
 	const authToken = optionalString(config.authToken, "authToken");
 	const agentDir = resolve(optionalString(config.agentDir, "agentDir") ?? getAgentDir());
 	const sessionDir = optionalString(config.sessionDir, "sessionDir") ?? "~/.pi-agent-server/sessions";
-	const hiworks = parseHiworks(config.hiworks);
+	const authFile = optionalString(config.authFile, "authFile") ?? "~/.pi/agent-server/codex-auth.json";
 
 	return {
 		host,
@@ -203,16 +121,15 @@ export async function loadAgentServerConfig(path: string): Promise<AgentServerCo
 		authToken,
 		agentDir,
 		sessionDir,
+		authFile,
+		authSessionTtlMs: integer(config.authSessionTtlMs, "authSessionTtlMs", 30 * 24 * 60 * 60 * 1_000, 1),
+		authPendingTtlMs: integer(config.authPendingTtlMs, "authPendingTtlMs", 900_000, 1),
+		secureCookies: optionalBoolean(config.secureCookies, "secureCookies", false),
 		maxBodyBytes: integer(config.maxBodyBytes, "maxBodyBytes", 1_048_576, 1),
 		maxRunHistory: integer(config.maxRunHistory, "maxRunHistory", 1_000, 1),
 		maxEventsPerRun: integer(config.maxEventsPerRun, "maxEventsPerRun", 20_000, 1),
-		...(hiworks ? { hiworks } : {}),
 		agents,
 	};
-}
-
-export function isLoopbackHost(host: string): boolean {
-	return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
 
 export function parsePort(value: string, description: string): number {

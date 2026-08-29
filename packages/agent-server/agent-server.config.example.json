@@ -2,15 +2,10 @@
 	"host": "127.0.0.1",
 	"port": 18731,
 	"sessionDir": "~/.pi/agent-server-/{agentid}/session",
-	"hiworks": {
-		"profile": "gabia",
-		"publicBaseUrl": "http://127.0.0.1:18731",
-		"redirectUri": "http://127.0.0.1:18731/auth/hiworks/callback",
-		"callbackPath": "/auth/hiworks/callback",
-		"scope": "read write",
-		"sessionTtlMs": 86400000,
-		"pendingTtlMs": 600000
-	},
+	"authFile": "~/.pi/agent-server/codex-auth.json",
+	"authSessionTtlMs": 2592000000,
+	"authPendingTtlMs": 900000,
+	"secureCookies": false,
 	"agents": {
 		"code-review": {
 			"cwd": "/srv/workspaces/project",

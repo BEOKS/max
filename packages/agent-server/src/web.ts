@@ -30,7 +30,9 @@ export function renderAgentWebPage(): string {
     button, input, select, textarea { font: inherit; }
     button { cursor: pointer; }
     button:disabled { cursor: not-allowed; opacity: .55; }
+    [hidden] { display: none !important; }
     .container { width: min(760px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 56px; }
+    .auth-card { width: min(420px, 100%); margin: 48px auto 0; }
     .header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
     h1, h2, p { margin: 0; }
     h1 { font-size: 1.35rem; letter-spacing: -.02em; }
@@ -48,6 +50,11 @@ export function renderAgentWebPage(): string {
     input, select { height: 40px; padding: 0 10px; }
     textarea { min-height: 150px; padding: 10px; resize: vertical; line-height: 1.5; }
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47, 107, 69, .12); }
+    .auth-note { margin-top: 14px; color: var(--muted); font-size: .78rem; line-height: 1.5; }
+    .device-code { margin-top: 20px; padding: 16px; color: var(--text); background: #f8faf8; border: 1px solid var(--border); border-radius: 6px; text-align: center; }
+    .device-code-value { margin-top: 8px; font: 700 1.5rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
+    .device-link { display: inline-block; margin-top: 12px; color: var(--accent); font-weight: 650; }
+    .device-status { margin-top: 12px; color: var(--muted); font-size: .82rem; line-height: 1.5; }
     .agent-meta { min-height: 18px; color: var(--muted); font-size: .78rem; }
     .actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 16px; }
     .primary { padding: 9px 14px; color: white; background: var(--accent); border: 1px solid var(--accent); border-radius: 5px; font-weight: 650; }
@@ -65,6 +72,7 @@ export function renderAgentWebPage(): string {
     .empty { color: var(--muted); font-size: .84rem; }
     @media (max-width: 560px) {
       .container { width: min(100% - 20px, 760px); padding-top: 20px; }
+      .auth-card { margin-top: 20px; }
       .header { align-items: flex-start; flex-direction: column; }
       .account { width: 100%; justify-content: space-between; }
       .card { padding: 16px; }
@@ -73,31 +81,56 @@ export function renderAgentWebPage(): string {
 </head>
 <body>
   <main class="container">
-    <header class="header">
-      <div><h1>PI Agent Server</h1><p class="subtitle">서버에 정의된 에이전트를 실행합니다.</p></div>
-      <div class="account"><span id="user-label">로그인 확인 중</span><button class="logout" id="logout" type="button">로그아웃</button></div>
-    </header>
-
-    <section class="card">
-      <form id="run-form">
-        <div class="field"><label for="agent">에이전트</label><select id="agent" required disabled><option>불러오는 중…</option></select><span class="agent-meta" id="agent-meta"></span></div>
-        <div class="field"><label for="session">세션 ID (선택)</label><input id="session" autocomplete="off" placeholder="기존 세션을 이어갈 때 입력"></div>
-        <div class="field"><label for="prompt">요청</label><textarea id="prompt" required placeholder="에이전트에게 요청할 내용을 입력하세요."></textarea></div>
-        <div class="actions"><button class="primary" id="submit" type="submit" disabled>실행</button></div>
-      </form>
-      <p class="error" id="error" role="alert"></p>
+    <section class="card auth-card" id="auth-card">
+      <h1 id="auth-title">Codex 로그인</h1>
+      <p class="subtitle" id="auth-subtitle">서비스를 사용하려면 Codex device code로 로그인하세요.</p>
+      <div class="device-code" id="device-login">
+        <p>OpenAI 인증 페이지에서 아래 코드를 입력하세요.</p>
+        <div class="device-code-value" id="device-code-value">준비 중…</div>
+        <a class="device-link" id="device-link" href="#" target="_blank" rel="noopener noreferrer" hidden>인증 페이지 열기</a>
+        <p class="device-status" id="device-status">로그인 준비 중…</p>
+      </div>
+      <div class="actions"><button class="secondary" id="device-retry" type="button" hidden>다시 시도</button></div>
+      <p class="error" id="auth-error" role="alert"></p>
+      <p class="auth-note">인증이 완료되면 이 브라우저에 로그인 세션이 저장됩니다.</p>
     </section>
 
-    <section class="card">
-      <div class="result-header"><h2>실행 결과</h2><span class="status queued" id="status" hidden>대기 중</span></div>
-      <p class="run-info" id="run-info">실행 결과가 여기에 표시됩니다.</p>
-      <pre id="output" class="empty">아직 실행된 요청이 없습니다.</pre>
-      <div class="actions"><button class="secondary" id="abort" type="button" hidden>중단</button></div>
-    </section>
+    <div id="app" hidden>
+      <header class="header">
+        <div><h1>PI Agent Server</h1><p class="subtitle">서버에 정의된 에이전트를 실행합니다.</p></div>
+        <div class="account"><span id="user-label">로그인 확인 중</span><button class="logout" id="logout" type="button">로그아웃</button></div>
+      </header>
+
+      <section class="card">
+        <form id="run-form">
+          <div class="field"><label for="agent">에이전트</label><select id="agent" required disabled><option>불러오는 중…</option></select><span class="agent-meta" id="agent-meta"></span></div>
+          <div class="field"><label for="session">세션 ID (선택)</label><input id="session" autocomplete="off" placeholder="기존 세션을 이어갈 때 입력"></div>
+          <div class="field"><label for="prompt">요청</label><textarea id="prompt" required placeholder="에이전트에게 요청할 내용을 입력하세요."></textarea></div>
+          <div class="actions"><button class="primary" id="submit" type="submit" disabled>실행</button></div>
+        </form>
+        <p class="error" id="error" role="alert"></p>
+      </section>
+
+      <section class="card">
+        <div class="result-header"><h2>실행 결과</h2><span class="status queued" id="status" hidden>대기 중</span></div>
+        <p class="run-info" id="run-info">실행 결과가 여기에 표시됩니다.</p>
+        <pre id="output" class="empty">아직 실행된 요청이 없습니다.</pre>
+        <div class="actions"><button class="secondary" id="abort" type="button" hidden>중단</button></div>
+      </section>
+    </div>
   </main>
 
   <script>
     (() => {
+      const authCard = document.getElementById('auth-card');
+      const authTitle = document.getElementById('auth-title');
+      const authSubtitle = document.getElementById('auth-subtitle');
+      const deviceCodeValue = document.getElementById('device-code-value');
+      const deviceLink = document.getElementById('device-link');
+      const deviceStatus = document.getElementById('device-status');
+      const deviceRetry = document.getElementById('device-retry');
+      const authError = document.getElementById('auth-error');
+      const app = document.getElementById('app');
       const agentSelect = document.getElementById('agent');
       const agentMeta = document.getElementById('agent-meta');
       const form = document.getElementById('run-form');
@@ -114,13 +147,18 @@ export function renderAgentWebPage(): string {
       let currentRun = null;
       let eventSource = null;
       let statusTimer = null;
+      let devicePollTimer = null;
+      let deviceLoginId = null;
+      let deviceLoginStarting = false;
 
       async function api(path, options) {
         const response = await fetch(path, Object.assign({ credentials: 'same-origin' }, options || {}));
         const contentType = response.headers.get('content-type') || '';
         const body = contentType.includes('application/json') ? await response.json() : await response.text();
         if (response.status === 401) {
-          window.location.assign('/auth/hiworks/login');
+          showAuth();
+          setAuthError('로그인이 필요합니다.');
+          void startDeviceLogin();
           throw new Error('로그인이 필요합니다.');
         }
         if (!response.ok) {
@@ -131,7 +169,23 @@ export function renderAgentWebPage(): string {
       }
 
       function setError(message) { error.textContent = message || ''; }
+      function setAuthError(message) { authError.textContent = message || ''; }
       function terminal(value) { return value === 'completed' || value === 'failed' || value === 'cancelled'; }
+
+      function showAuth() {
+        stopTracking();
+        authCard.hidden = false;
+        app.hidden = true;
+        authTitle.textContent = 'Codex 로그인';
+        authSubtitle.textContent = '서비스를 사용하려면 Codex device code로 로그인하세요.';
+      }
+
+      function showApp(user) {
+        authCard.hidden = true;
+        app.hidden = false;
+        const account = user || {};
+        document.getElementById('user-label').textContent = account.displayName || account.email || account.id || '사용자';
+      }
 
       function updateAgentMeta() {
         const agent = agents.find((item) => item.id === agentSelect.value);
@@ -155,6 +209,66 @@ export function renderAgentWebPage(): string {
       function stopTracking() {
         if (eventSource) { eventSource.close(); eventSource = null; }
         if (statusTimer) { window.clearInterval(statusTimer); statusTimer = null; }
+        if (devicePollTimer) { window.clearTimeout(devicePollTimer); devicePollTimer = null; }
+      }
+
+      function showDeviceCode(result) {
+        deviceLoginId = result.loginId;
+        deviceCodeValue.textContent = result.userCode;
+        deviceLink.href = result.verificationUri;
+        deviceLink.hidden = false;
+        deviceRetry.hidden = true;
+        deviceStatus.textContent = '인증 페이지에서 코드를 입력하면 자동으로 로그인됩니다.';
+      }
+
+      async function pollDeviceLogin() {
+        if (!deviceLoginId) return;
+        try {
+          const result = await api('/auth/device/status?loginId=' + encodeURIComponent(deviceLoginId));
+          if (result.status === 'complete') {
+            deviceLoginId = null;
+            deviceStatus.textContent = '로그인되었습니다.';
+            showApp(result.user);
+            await loadAgents();
+            return;
+          }
+          if (result.status === 'failed') {
+            deviceStatus.textContent = result.error || 'Codex 로그인을 완료하지 못했습니다.';
+            deviceRetry.hidden = false;
+            return;
+          }
+          devicePollTimer = window.setTimeout(pollDeviceLogin, 1500);
+        } catch (reason) {
+          deviceStatus.textContent = reason.message || '로그인 상태를 확인할 수 없습니다.';
+          deviceRetry.hidden = false;
+        }
+      }
+
+      async function startDeviceLogin() {
+        if (deviceLoginStarting || !app.hidden) return;
+        deviceLoginStarting = true;
+        showAuth();
+        setAuthError('');
+        deviceRetry.hidden = true;
+        deviceLink.hidden = true;
+        deviceCodeValue.textContent = '준비 중…';
+        deviceStatus.textContent = '로그인 준비 중…';
+        try {
+          const result = await api('/auth/device/start', { method: 'POST' });
+          if (result.status === 'authenticated') {
+            showApp(result.user);
+            await loadAgents();
+            return;
+          }
+          showDeviceCode(result);
+          await pollDeviceLogin();
+        } catch (reason) {
+          setAuthError(reason.message || 'Codex 로그인을 시작할 수 없습니다.');
+          deviceStatus.textContent = '로그인을 다시 시도하세요.';
+          deviceRetry.hidden = false;
+        } finally {
+          deviceLoginStarting = false;
+        }
       }
 
       function updateRun(snapshot) {
@@ -195,16 +309,25 @@ export function renderAgentWebPage(): string {
         }, 1500);
       }
 
+      async function loadAgents() {
+        const response = await api('/v1/agents');
+        agents = response.agents || [];
+        renderAgents();
+      }
+
       async function load() {
         try {
           const me = await api('/auth/me');
-          if (!me.authenticated) { window.location.assign('/auth/hiworks/login'); return; }
-          const user = me.user || {};
-          document.getElementById('user-label').textContent = user.displayName || user.email || user.id || 'Hiworks 사용자';
-          const response = await api('/v1/agents');
-          agents = response.agents || [];
-          renderAgents();
-        } catch (reason) { setError(reason.message); }
+          if (!me.authenticated) {
+            showAuth();
+            await startDeviceLogin();
+            return;
+          }
+          showApp(me.user);
+          await loadAgents();
+        } catch (reason) {
+          if (app.hidden) setAuthError(reason.message); else setError(reason.message);
+        }
       }
 
       agentSelect.addEventListener('change', updateAgentMeta);
@@ -232,8 +355,9 @@ export function renderAgentWebPage(): string {
         catch (reason) { setError(reason.message); abort.disabled = false; }
       });
 
+      deviceRetry.addEventListener('click', () => { void startDeviceLogin(); });
       document.getElementById('logout').addEventListener('click', async () => {
-        try { await api('/auth/hiworks/logout', { method: 'POST' }); } finally { window.location.assign('/'); }
+        try { await api('/auth/logout', { method: 'POST' }); } finally { setAuthError(''); showAuth(); void startDeviceLogin(); }
       });
       load();
     })();

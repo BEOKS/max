@@ -21,6 +21,7 @@ export type { PiMessagesEvent, PiMessagesOptions, PiMessagesRewriteImpact } from
 export * from "./auth/context.ts";
 export * from "./auth/credential-store.ts";
 export * from "./auth/helpers.ts";
+export { loadOpenAICodexOAuth } from "./auth/oauth/load.ts";
 export * from "./auth/types.ts";
 export type {
 	OAuthAuthInfo,

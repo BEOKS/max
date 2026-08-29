@@ -1,114 +1,163 @@
-import { PROFILES } from "hiworks-browser-auth";
-import { describe, expect, test } from "vitest";
-import { HiworksAuthService } from "../src/auth.ts";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, test } from "vitest";
+import { CODEX_PROVIDER_ID, CodexDeviceAuthService, DEVICE_LOGIN_COOKIE, type DeviceLoginStatus } from "../src/auth.ts";
 
-describe("HiworksAuthService", () => {
-	test("builds a PKCE login URL and isolates a browser session", async () => {
-		let clock = 1_000_000;
-		let refreshCalls = 0;
-		const auth = new HiworksAuthService({
-			profile: "gabia",
-			publicBaseUrl: "https://agents.example.test",
-			redirectUri: "https://agents.example.test/auth/hiworks/callback",
-			callbackPath: "/auth/hiworks/callback",
-			scope: "read",
-			sessionTtlMs: 60_000,
-			pendingTtlMs: 10_000,
-			refreshSkewMs: 0,
-			now: () => clock,
-			exchangeCodeForToken: async (parameters) => {
-				expect(parameters.code).toBe("authorization-code");
-				expect(parameters.redirectUri).toBe("https://agents.example.test/auth/hiworks/callback");
-				expect(parameters.codeVerifier).toBeTruthy();
-				return {
-					access_token: "access-token-1",
-					token_type: "Bearer",
-					expires_in: 30,
-					refresh_token: "refresh-token-1",
-				};
-			},
-			refreshAccessToken: async () => {
-				refreshCalls += 1;
-				return {
-					access_token: "access-token-2",
-					token_type: "Bearer",
-					expires_in: 3_600,
-				};
-			},
-			fetchMe: async (accessToken, meUrl) => {
-				expect(accessToken).toBe("access-token-1");
-				expect(meUrl).toBe("https://cache-api.gabiaoffice.hiworks.com/me");
-				return { user_no: 1234, email: "user@example.com", name: "Test User" };
-			},
-		});
+const temporaryDirectories: string[] = [];
 
-		const login = auth.startLogin();
-		const authorizeUrl = new URL(login.location);
-		expect(authorizeUrl.searchParams.get("client_id")).toBe(PROFILES.gabia.clientId);
-		expect(authorizeUrl.searchParams.get("state")).toBeTruthy();
-		expect(authorizeUrl.searchParams.get("code_challenge")).toBeTruthy();
-		expect(authorizeUrl.searchParams.get("code_challenge_method")).toBe("S256");
-		expect(login.setCookie).toContain("pi_agent_oauth_state=");
-		expect(login.setCookie).toContain("HttpOnly");
-		expect(login.setCookie).toContain("Secure");
+afterEach(async () => {
+	await Promise.all(temporaryDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+	temporaryDirectories.length = 0;
+});
 
-		const state = authorizeUrl.searchParams.get("state");
-		if (!state) throw new Error("Missing OAuth state");
-		const completion = await auth.completeLogin(
-			new URL(`https://agents.example.test/auth/hiworks/callback?code=authorization-code&state=${state}`),
-			`pi_agent_oauth_state=${state}`,
-		);
-		expect(completion.principal).toEqual({
-			id: "hiworks:gabia:1234",
-			source: "hiworks",
-			profile: "gabia",
+describe("CodexDeviceAuthService", () => {
+	test("starts device login, persists the account, and restores the session", async () => {
+		const directory = await makeTemporaryDirectory();
+		const oauth = new FakeCodexOAuth();
+		const authFile = join(directory, "codex-auth.json");
+		const auth = new CodexDeviceAuthService({ authFile, oauth, secureCookies: true });
+
+		const start = await auth.startDeviceLogin();
+		expect(start.userCode).toBe("ABCD-1234");
+		expect(start.verificationUri).toBe("https://auth.openai.com/codex/device");
+		expect(start.setCookie).toContain(`${DEVICE_LOGIN_COOKIE}=`);
+
+		const pending = await auth.getDeviceLoginStatus(start.loginId, start.setCookie);
+		expect(pending).toMatchObject({ status: "pending", loginId: start.loginId, userCode: "ABCD-1234" });
+
+		oauth.complete();
+		const completed = await waitForCompleted(auth, start.loginId, start.setCookie);
+		expect(completed.user).toEqual({
+			id: "codex:account-123",
+			source: "codex",
+			accountId: "account-123",
 			email: "user@example.com",
-			displayName: "Test User",
+			displayName: "Codex User",
 			admin: false,
 		});
+		expect(completed.setCookies[0]).toContain("pi_agent_session=");
 
-		const sessionCookie = cookieValue(completion.setCookies[0], "pi_agent_session");
-		expect(await auth.authenticate(`pi_agent_session=${sessionCookie}`)).toEqual(completion.principal);
+		const sessionCookie = completed.setCookies[0];
+		expect(await auth.authenticate(sessionCookie)).toEqual(completed.user);
+		const credentialStore = auth.credentialStoreFor(completed.user.id);
+		expect(await credentialStore.read(CODEX_PROVIDER_ID)).toMatchObject({
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+		});
 
-		clock += 31_000;
-		const [refreshedA, refreshedB] = await Promise.all([
-			auth.authenticate(`pi_agent_session=${sessionCookie}`),
-			auth.authenticate(`pi_agent_session=${sessionCookie}`),
-		]);
-		expect(refreshedA).toEqual(completion.principal);
-		expect(refreshedB).toEqual(completion.principal);
-		expect(refreshCalls).toBe(1);
+		const stored = await readFile(authFile, "utf8");
+		expect(stored).toContain("refresh-token");
+		expect(stored).not.toContain("ABCD-1234");
 
-		const logoutCookie = auth.logout(`pi_agent_session=${sessionCookie}`);
-		expect(logoutCookie).toContain("Max-Age=0");
-		expect(await auth.authenticate(`pi_agent_session=${sessionCookie}`)).toBeUndefined();
+		const restarted = new CodexDeviceAuthService({ authFile, oauth });
+		await restarted.initialize();
+		expect(await restarted.authenticate(sessionCookie)).toEqual(completed.user);
+		expect(await restarted.credentialStoreFor(completed.user.id).read(CODEX_PROVIDER_ID)).toMatchObject({
+			access: "access-token",
+		});
+
+		const logoutCookies = await restarted.logout(sessionCookie);
+		expect(logoutCookies[0]).toContain("Max-Age=0");
+		expect(await restarted.authenticate(sessionCookie)).toBeUndefined();
 	});
 
-	test("rejects a callback whose state does not match the browser cookie", async () => {
-		const auth = new HiworksAuthService({
-			profile: "gabia",
-			publicBaseUrl: "http://127.0.0.1:8787",
-			callbackPath: "/auth/hiworks/callback",
-			scope: "read",
-			sessionTtlMs: 60_000,
-			pendingTtlMs: 10_000,
-		});
-		const login = auth.startLogin();
-		const state = new URL(login.location).searchParams.get("state");
-		if (!state) throw new Error("Missing OAuth state");
+	test("binds device status to its login cookie and isolates credentials by account", async () => {
+		const directory = await makeTemporaryDirectory();
+		const oauth = new FakeCodexOAuth();
+		const auth = new CodexDeviceAuthService({ authFile: join(directory, "codex-auth.json"), oauth });
+		const start = await auth.startDeviceLogin();
 
-		await expect(
-			auth.completeLogin(
-				new URL(`http://127.0.0.1:8787/auth/hiworks/callback?code=code&state=${state}`),
-				"pi_agent_oauth_state=wrong-state",
-			),
-		).rejects.toMatchObject({ code: "invalid_oauth_state", statusCode: 400 });
+		await expect(auth.getDeviceLoginStatus(start.loginId, "pi_agent_device_login=wrong")).rejects.toMatchObject({
+			code: "invalid_device_login",
+			statusCode: 404,
+		});
+
+		oauth.complete();
+		const completed = await waitForCompleted(auth, start.loginId, start.setCookie);
+		const store = auth.credentialStoreFor(completed.user.id);
+		expect(await store.read(CODEX_PROVIDER_ID)).toBeDefined();
+		expect(await auth.credentialStoreFor("codex:another-account").read(CODEX_PROVIDER_ID)).toBeUndefined();
+	});
+
+	test("expires persistent sessions", async () => {
+		let now = 1_000;
+		const directory = await makeTemporaryDirectory();
+		const oauth = new FakeCodexOAuth();
+		const auth = new CodexDeviceAuthService({
+			authFile: join(directory, "codex-auth.json"),
+			oauth,
+			sessionTtlMs: 100,
+			now: () => now,
+		});
+		const start = await auth.startDeviceLogin();
+		oauth.complete();
+		const completed = await waitForCompleted(auth, start.loginId, start.setCookie);
+
+		now += 101;
+		expect(await auth.authenticate(completed.setCookies[0])).toBeUndefined();
 	});
 });
 
-function cookieValue(setCookie: string, name: string): string {
-	const prefix = `${name}=`;
-	const value = setCookie.split(";", 1)[0];
-	if (!value.startsWith(prefix)) throw new Error(`Cookie ${name} was not set`);
-	return decodeURIComponent(value.slice(prefix.length));
+class FakeCodexOAuth implements OAuthAuth {
+	readonly name = "Fake Codex";
+	readonly isSubscription = true;
+	#resolve: ((credential: OAuthCredential) => void) | undefined;
+
+	async login(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
+		interaction.notify({
+			type: "device_code",
+			userCode: "ABCD-1234",
+			verificationUri: "https://auth.openai.com/codex/device",
+			intervalSeconds: 1,
+			expiresInSeconds: 900,
+		});
+		return new Promise<OAuthCredential>((resolve, reject) => {
+			this.#resolve = resolve;
+			interaction.signal.addEventListener("abort", () => reject(new Error("Login cancelled")), { once: true });
+		});
+	}
+
+	async refresh(credential: OAuthCredential): Promise<OAuthCredential> {
+		return credential;
+	}
+
+	async toAuth(credential: OAuthCredential): Promise<{ apiKey: string }> {
+		return { apiKey: credential.access };
+	}
+
+	complete(): void {
+		this.#resolve?.({
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 3_600_000,
+			accountId: "account-123",
+			email: "user@example.com",
+			displayName: "Codex User",
+		});
+		this.#resolve = undefined;
+	}
+}
+
+async function waitForCompleted(
+	auth: CodexDeviceAuthService,
+	loginId: string,
+	cookie: string,
+): Promise<Extract<DeviceLoginStatus, { status: "complete" }>> {
+	for (let attempt = 0; attempt < 50; attempt++) {
+		const status = await auth.getDeviceLoginStatus(loginId, cookie);
+		if (status.status === "complete") return status;
+		if (status.status === "failed") throw new Error(status.error);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	throw new Error("Timed out waiting for fake Codex login");
+}
+
+async function makeTemporaryDirectory(): Promise<string> {
+	const directory = await mkdtemp(join(tmpdir(), "pi-agent-auth-test-"));
+	temporaryDirectories.push(directory);
+	return directory;
 }

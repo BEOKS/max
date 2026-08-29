@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
-import type { HiworksServerConfig } from "./config.ts";
+import { loadOpenAICodexOAuth } from "@earendil-works/pi-ai";
 import {
 	AgentApiServer,
 	AgentRegistry,
+	CodexDeviceAuthService,
 	CodingAgentRuntimeFactory,
-	HiworksAuthService,
-	isLoopbackHost,
 	loadAgentServerConfig,
 	parsePort,
 } from "./index.ts";
@@ -47,13 +46,10 @@ function printHelp(): void {
 			"  PI_AGENT_SERVER_HOST    Host override",
 			"  PI_AGENT_SERVER_PORT    Port override",
 			"  PI_AGENT_SERVER_SESSION_DIR  Session directory override",
+			"  PI_AGENT_SERVER_AUTH_FILE     Codex auth file override",
+			"  PI_AGENT_SERVER_AUTH_PENDING_TTL_MS  Device login timeout override",
+			"  PI_AGENT_SERVER_SECURE_COOKIES  Set true for HTTPS deployments",
 			"  PI_AGENT_DIR            pi auth/models directory override",
-			"  PI_AGENT_SERVER_HIWORKS_PROFILE       Hiworks profile override",
-			"  PI_AGENT_SERVER_HIWORKS_PUBLIC_URL    OAuth callback base URL override",
-			"  PI_AGENT_SERVER_HIWORKS_REDIRECT_URI  Exact OAuth redirect URI override",
-			"  PI_AGENT_SERVER_HIWORKS_CLIENT_ID     OAuth client ID override",
-			"  PI_AGENT_SERVER_HIWORKS_CLIENT_SECRET OAuth client secret override",
-			"  PI_AGENT_SERVER_HIWORKS_SCOPE         OAuth scope override",
 			"",
 		].join("\n"),
 	);
@@ -74,21 +70,34 @@ async function run(): Promise<void> {
 	const authToken = process.env.PI_AGENT_SERVER_TOKEN ?? loaded.authToken;
 	const agentDir = process.env.PI_AGENT_DIR ?? loaded.agentDir;
 	const sessionDir = process.env.PI_AGENT_SERVER_SESSION_DIR ?? loaded.sessionDir;
-	const hiworksConfig = resolveHiworksConfig(loaded.hiworks);
-	if (!isLoopbackHost(host) && !authToken && !hiworksConfig) {
-		throw new Error(
-			"An authToken, Hiworks authentication, or PI_AGENT_SERVER_TOKEN is required when binding outside localhost",
-		);
-	}
+	const authFile = process.env.PI_AGENT_SERVER_AUTH_FILE ?? loaded.authFile;
+	const pendingTtlMs = process.env.PI_AGENT_SERVER_AUTH_PENDING_TTL_MS
+		? parsePositiveInteger(process.env.PI_AGENT_SERVER_AUTH_PENDING_TTL_MS, "PI_AGENT_SERVER_AUTH_PENDING_TTL_MS")
+		: loaded.authPendingTtlMs;
+	const secureCookies = process.env.PI_AGENT_SERVER_SECURE_COOKIES
+		? parseBoolean(process.env.PI_AGENT_SERVER_SECURE_COOKIES, "PI_AGENT_SERVER_SECURE_COOKIES")
+		: loaded.secureCookies;
 
+	const oauth = await loadOpenAICodexOAuth();
+	const auth = new CodexDeviceAuthService({
+		authFile,
+		oauth,
+		sessionTtlMs: loaded.authSessionTtlMs,
+		pendingTtlMs,
+		secureCookies,
+	});
+	await auth.initialize();
 	const registry = new AgentRegistry(loaded.agents);
-	const factory = new CodingAgentRuntimeFactory({ agentDir, sessionDir });
-	const hiworksAuth = hiworksConfig ? new HiworksAuthService(hiworksConfig) : undefined;
+	const factory = new CodingAgentRuntimeFactory({
+		agentDir,
+		sessionDir,
+		credentialsForOwner: (ownerId, fallback) => auth.credentialStoreFor(ownerId, fallback),
+	});
 	const server = new AgentApiServer(registry, factory, {
 		host,
 		port,
 		authToken,
-		hiworksAuth,
+		auth,
 		maxBodyBytes: loaded.maxBodyBytes,
 		maxRunHistory: loaded.maxRunHistory,
 		maxEventsPerRun: loaded.maxEventsPerRun,
@@ -97,7 +106,6 @@ async function run(): Promise<void> {
 
 	await server.start();
 	process.stdout.write(`pi-agent-server listening at ${server.address ?? `${host}:${port}`}\n`);
-	if (hiworksAuth) process.stdout.write(`Hiworks OAuth redirect URI: ${hiworksAuth.redirectUri}\n`);
 	await new Promise<void>((resolveShutdown) => {
 		let shuttingDown = false;
 		const shutdown = async (signal: string): Promise<void> => {
@@ -118,47 +126,17 @@ async function run(): Promise<void> {
 	});
 }
 
-function resolveHiworksConfig(config: HiworksServerConfig | undefined): HiworksServerConfig | undefined {
-	const profileValue = process.env.PI_AGENT_SERVER_HIWORKS_PROFILE;
-	const publicBaseUrl = process.env.PI_AGENT_SERVER_HIWORKS_PUBLIC_URL;
-	const redirectUri = process.env.PI_AGENT_SERVER_HIWORKS_REDIRECT_URI;
-	const callbackPath = process.env.PI_AGENT_SERVER_HIWORKS_CALLBACK_PATH;
-	const scope = process.env.PI_AGENT_SERVER_HIWORKS_SCOPE;
-	const clientId = process.env.PI_AGENT_SERVER_HIWORKS_CLIENT_ID;
-	const clientSecret = process.env.PI_AGENT_SERVER_HIWORKS_CLIENT_SECRET;
-	const hasEnvironmentConfig = [
-		profileValue,
-		publicBaseUrl,
-		redirectUri,
-		callbackPath,
-		scope,
-		clientId,
-		clientSecret,
-	].some((value) => value !== undefined);
-	if (!config && !hasEnvironmentConfig) return undefined;
-	const base = config ?? {
-		profile: "gabia" as const,
-		publicBaseUrl: publicBaseUrl ?? "",
-		...(redirectUri ? { redirectUri } : {}),
-		callbackPath: "/auth/hiworks/callback",
-		scope: "read write",
-		sessionTtlMs: 86_400_000,
-		pendingTtlMs: 600_000,
-	};
-	const profile = profileValue ?? base.profile;
-	if (profile !== "gabia" && profile !== "dev") {
-		throw new Error("PI_AGENT_SERVER_HIWORKS_PROFILE must be gabia or dev");
-	}
-	return {
-		...base,
-		profile,
-		publicBaseUrl: publicBaseUrl ?? base.publicBaseUrl,
-		...((redirectUri ?? base.redirectUri) ? { redirectUri: redirectUri ?? base.redirectUri } : {}),
-		callbackPath: callbackPath ?? base.callbackPath,
-		scope: scope ?? base.scope,
-		...((clientId ?? base.clientId) ? { clientId: clientId ?? base.clientId } : {}),
-		...((clientSecret ?? base.clientSecret) ? { clientSecret: clientSecret ?? base.clientSecret } : {}),
-	};
+function parseBoolean(value: string, description: string): boolean {
+	if (value === "1" || value === "true") return true;
+	if (value === "0" || value === "false") return false;
+	throw new Error(`${description} must be true or false`);
+}
+
+function parsePositiveInteger(value: string, description: string): number {
+	if (!/^\d+$/u.test(value)) throw new Error(`${description} must be a positive integer`);
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${description} must be a positive integer`);
+	return parsed;
 }
 
 try {

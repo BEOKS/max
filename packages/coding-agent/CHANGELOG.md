@@ -42,6 +42,8 @@
 
 ### Changed
 
+- Changed the default system prompt to prefer minimal implementations and single-purpose user-facing screens.
+
 - Changed experimental installer-managed installations so `pi update` stages, verifies, and atomically activates the selected release in place. See [Install and Manage](docs/packages.md#install-and-manage).
 - Changed inherited built-in xAI models to use the Responses API with encrypted reasoning replay and made Grok 4.6 the default xAI model ([#8124](https://github.com/earendil-works/pi/pull/8124) by [@Jaaneek](https://github.com/Jaaneek)).
 - Changed inherited Anthropic, Azure OpenAI, Google, Mistral, and OpenAI adapters to send Pi's default `User-Agent` unless overridden ([#8305](https://github.com/earendil-works/pi/issues/8305)).

@@ -1,15 +1,10 @@
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, test } from "vitest";
-import {
-	type AgentAuthService,
-	type AgentPrincipal,
-	HiworksAuthService,
-	type HiworksLoginCompletion,
-	type HiworksLoginStart,
-} from "../src/auth.ts";
+import { type AgentAuthService, type AgentPrincipal, CodexDeviceAuthService } from "../src/auth.ts";
 import { AgentApiServer } from "../src/http.ts";
 import { AgentRegistry } from "../src/registry.ts";
 import { CodingAgentRuntimeFactory } from "../src/runtime.ts";
@@ -199,12 +194,12 @@ describe("pi-agent-server HTTP integration", () => {
 		}
 	}, 15_000);
 
-	test("isolates runs and sessions between Hiworks users", async () => {
+	test("isolates runs and sessions between authenticated users", async () => {
 		const factory = new BlockingRuntimeFactory();
 		const server = new AgentApiServer(new AgentRegistry([fakeDefinition]), factory, {
 			host: "127.0.0.1",
 			port: 0,
-			hiworksAuth: new TestCookieAuthService(),
+			auth: new TestCookieAuthService(),
 			maxBodyBytes: 64 * 1024,
 			maxRunHistory: 20,
 			maxEventsPerRun: 100,
@@ -272,29 +267,14 @@ describe("pi-agent-server HTTP integration", () => {
 		}
 	}, 15_000);
 
-	test("supports Hiworks login, current-user, and logout routes", async () => {
-		const auth = new HiworksAuthService({
-			profile: "gabia",
-			publicBaseUrl: "http://127.0.0.1:8787",
-			callbackPath: "/auth/hiworks/callback",
-			scope: "read",
-			sessionTtlMs: 60_000,
-			pendingTtlMs: 10_000,
-			exchangeCodeForToken: async () => ({
-				access_token: "route-access-token",
-				token_type: "Bearer",
-				expires_in: 3_600,
-				refresh_token: "route-refresh-token",
-			}),
-			fetchMe: async (accessToken) => {
-				expect(accessToken).toBe("route-access-token");
-				return { user_no: "route-user", email: "route@example.com" };
-			},
-		});
+	test("starts Codex device login, restores the session, and removes password routes", async () => {
+		const authDirectory = await makeTemporaryDirectory("pi-agent-auth-route-");
+		const oauth = new FakeCodexOAuth();
+		const auth = new CodexDeviceAuthService({ authFile: join(authDirectory, "codex-auth.json"), oauth });
 		const server = new AgentApiServer(new AgentRegistry([fakeDefinition]), new BlockingRuntimeFactory(), {
 			host: "127.0.0.1",
 			port: 0,
-			hiworksAuth: auth,
+			auth,
 			maxBodyBytes: 64 * 1024,
 			maxRunHistory: 20,
 			maxEventsPerRun: 100,
@@ -309,24 +289,31 @@ describe("pi-agent-server HTTP integration", () => {
 			expect(anonymousMe.status).toBe(200);
 			expect(await anonymousMe.json()).toEqual({ authenticated: false, user: null });
 			const anonymousHome = await fetch(`${baseUrl}/`, { redirect: "manual" });
-			expect(anonymousHome.status).toBe(302);
-			expect(anonymousHome.headers.get("location")).toBe("/auth/hiworks/login");
+			expect(anonymousHome.status).toBe(200);
+			const homeHtml = await anonymousHome.text();
+			expect(homeHtml).toContain("device-code");
+			expect(homeHtml).not.toContain("회원가입");
 
-			const login = await fetch(`${baseUrl}/auth/hiworks/login`, { redirect: "manual" });
-			expect(login.status).toBe(302);
-			const loginLocation = login.headers.get("location");
-			const state = loginLocation ? new URL(loginLocation).searchParams.get("state") : undefined;
-			if (!state) throw new Error("Hiworks login route did not return state");
-			const stateCookie = cookieValueFromHeader(login.headers.get("set-cookie"), "pi_agent_oauth_state");
-			expect(stateCookie).toBe(state);
+			const start = await fetch(`${baseUrl}/auth/device/start`, {
+				method: "POST",
+			});
+			expect(start.status).toBe(200);
+			const startBody = (await start.json()) as { loginId: string; userCode: string };
+			expect(startBody.userCode).toBe("ABCD-1234");
+			const loginCookie = cookieValueFromHeader(start.headers.get("set-cookie"), "pi_agent_device_login");
+			const pending = await fetch(`${baseUrl}/auth/device/status?loginId=${encodeURIComponent(startBody.loginId)}`, {
+				headers: { Cookie: `pi_agent_device_login=${loginCookie}` },
+			});
+			expect(pending.status).toBe(200);
+			expect(((await pending.json()) as { status: string }).status).toBe("pending");
 
-			const callback = await fetch(
-				`${baseUrl}/auth/hiworks/callback?code=route-code&state=${encodeURIComponent(state)}`,
-				{ headers: { Cookie: `pi_agent_oauth_state=${stateCookie}` }, redirect: "manual" },
-			);
-			expect(callback.status).toBe(303);
-			expect(callback.headers.get("location")).toBe("/");
-			const sessionCookie = cookieValueFromHeader(callback.headers.get("set-cookie"), "pi_agent_session");
+			oauth.complete();
+			const sessionResponse = await waitForDeviceLogin(baseUrl, startBody.loginId, loginCookie);
+			expect(sessionResponse.status).toBe(200);
+			const sessionBody = (await sessionResponse.json()) as { user: { id: string; source: string } };
+			expect(sessionBody.user).toMatchObject({ id: "codex:route-account", source: "codex" });
+			const sessionCookie = cookieValueFromHeader(sessionResponse.headers.get("set-cookie"), "pi_agent_session");
+
 			const home = await fetch(`${baseUrl}/`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } });
 			expect(home.status).toBe(200);
 			expect(await home.text()).toContain("PI Agent Server");
@@ -336,18 +323,33 @@ describe("pi-agent-server HTTP integration", () => {
 			expect(await me.json()).toEqual({
 				authenticated: true,
 				user: {
-					id: "hiworks:gabia:route-user",
-					source: "hiworks",
+					id: "codex:route-account",
+					source: "codex",
 					admin: false,
-					profile: "gabia",
-					email: "route@example.com",
+					accountId: "route-account",
 				},
 			});
 			expect(
 				(await fetch(`${baseUrl}/v1/agents`, { headers: { Cookie: `pi_agent_session=${sessionCookie}` } })).status,
 			).toBe(200);
+			expect(
+				(
+					await fetch(`${baseUrl}/auth/signup`, {
+						method: "POST",
+						headers: { Cookie: `pi_agent_session=${sessionCookie}` },
+					})
+				).status,
+			).toBe(404);
+			expect(
+				(
+					await fetch(`${baseUrl}/auth/login`, {
+						method: "POST",
+						headers: { Cookie: `pi_agent_session=${sessionCookie}` },
+					})
+				).status,
+			).toBe(404);
 
-			const logout = await fetch(`${baseUrl}/auth/hiworks/logout`, {
+			const logout = await fetch(`${baseUrl}/auth/logout`, {
 				method: "POST",
 				headers: { Cookie: `pi_agent_session=${sessionCookie}` },
 			});
@@ -365,7 +367,7 @@ describe("pi-agent-server HTTP integration", () => {
 		const server = new AgentApiServer(new AgentRegistry([definition]), new SessionReadingFactory(), {
 			host: "127.0.0.1",
 			port: 0,
-			hiworksAuth: new TestCookieAuthService(),
+			auth: new TestCookieAuthService(),
 			maxBodyBytes: 64 * 1024,
 			maxRunHistory: 20,
 			maxEventsPerRun: 100,
@@ -422,11 +424,48 @@ describe("pi-agent-server HTTP integration", () => {
 	}, 15_000);
 });
 
+class FakeCodexOAuth implements OAuthAuth {
+	readonly name = "Fake Codex";
+	#resolve: ((credential: OAuthCredential) => void) | undefined;
+
+	async login(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
+		interaction.notify({
+			type: "device_code",
+			userCode: "ABCD-1234",
+			verificationUri: "https://auth.openai.com/codex/device",
+			intervalSeconds: 1,
+			expiresInSeconds: 900,
+		});
+		return new Promise<OAuthCredential>((resolve) => {
+			this.#resolve = resolve;
+			interaction.signal.addEventListener("abort", () => {}, { once: true });
+		});
+	}
+
+	async refresh(credential: OAuthCredential): Promise<OAuthCredential> {
+		return credential;
+	}
+
+	async toAuth(credential: OAuthCredential): Promise<{ apiKey: string }> {
+		return { apiKey: credential.access };
+	}
+
+	complete(): void {
+		this.#resolve?.({
+			type: "oauth",
+			access: "route-access-token",
+			refresh: "route-refresh-token",
+			expires: Date.now() + 3_600_000,
+			accountId: "route-account",
+		});
+		this.#resolve = undefined;
+	}
+}
+
 class TestCookieAuthService implements AgentAuthService {
-	readonly callbackPath = "/auth/hiworks/callback";
 	readonly #principals = new Map<string, AgentPrincipal>([
-		["user-a", { id: "hiworks:gabia:user-a", source: "hiworks", profile: "gabia", admin: false }],
-		["user-b", { id: "hiworks:gabia:user-b", source: "hiworks", profile: "gabia", admin: false }],
+		["user-a", { id: "codex:user-a", source: "codex", accountId: "user-a", email: "a@example.com", admin: false }],
+		["user-b", { id: "codex:user-b", source: "codex", accountId: "user-b", email: "b@example.com", admin: false }],
 	]);
 
 	async authenticate(cookieHeader?: string): Promise<AgentPrincipal | undefined> {
@@ -437,16 +476,8 @@ class TestCookieAuthService implements AgentAuthService {
 		return cookie ? this.#principals.get(cookie.slice("pi_agent_session=".length)) : undefined;
 	}
 
-	startLogin(): HiworksLoginStart {
-		return { location: "https://hiworks.example.test/login", setCookie: "pi_agent_oauth_state=test" };
-	}
-
-	async completeLogin(): Promise<HiworksLoginCompletion> {
-		throw new Error("Not used in this test");
-	}
-
-	logout(): string {
-		return "pi_agent_session=; Max-Age=0; Path=/";
+	async logout(): Promise<readonly string[]> {
+		return ["pi_agent_session=; Max-Age=0; Path=/"];
 	}
 }
 
@@ -462,7 +493,7 @@ class SessionReadingFactory implements AgentRuntimeFactory {
 		sessionId: string,
 		ownerId?: string,
 	): Promise<AgentSessionSnapshot | undefined> {
-		if (definition.id !== "history-agent" || sessionId !== "history" || ownerId !== "hiworks:gabia:user-a") {
+		if (definition.id !== "history-agent" || sessionId !== "history" || ownerId !== "codex:user-a") {
 			return undefined;
 		}
 		return {
@@ -599,6 +630,19 @@ async function makeTemporaryDirectory(prefix: string): Promise<string> {
 	const directory = await mkdtemp(join(tmpdir(), prefix));
 	temporaryDirectories.push(directory);
 	return directory;
+}
+
+async function waitForDeviceLogin(baseUrl: string, loginId: string, loginCookie: string): Promise<Response> {
+	for (let attempt = 0; attempt < 50; attempt++) {
+		const response = await fetch(`${baseUrl}/auth/device/status?loginId=${encodeURIComponent(loginId)}`, {
+			headers: { Cookie: `pi_agent_device_login=${loginCookie}` },
+		});
+		const body = (await response.clone().json()) as { status?: string };
+		if (body.status === "complete") return response;
+		if (body.status === "failed") throw new Error("Device login failed");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	throw new Error("Timed out waiting for fake Codex login");
 }
 
 async function waitForRunStatus(

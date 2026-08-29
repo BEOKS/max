@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AgentAuthService, AgentPrincipal } from "./auth.ts";
+import type { AgentAuthService, AgentDeviceAuthService, AgentPrincipal, DeviceLoginStatus } from "./auth.ts";
 import { AgentServerError, AgentSessionNotFoundError } from "./errors.ts";
 import { type AgentRegistry, isSafeIdentifier } from "./registry.ts";
 import { AgentRunManager } from "./runs.ts";
@@ -13,7 +13,7 @@ export interface AgentApiServerOptions {
 	host: string;
 	port: number;
 	authToken?: string;
-	hiworksAuth?: AgentAuthService;
+	auth?: AgentAuthService;
 	maxBodyBytes: number;
 	maxRunHistory: number;
 	maxEventsPerRun: number;
@@ -127,12 +127,8 @@ export class AgentApiServer {
 		if (pathname === "/" || pathname === "/index.html") {
 			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
 			const principal = await this.#authenticate(request);
-			if (this.#options.hiworksAuth && (!principal || principal.source === "anonymous")) {
-				response.writeHead(302, {
-					Location: "/auth/hiworks/login",
-					"Cache-Control": "no-store",
-				});
-				response.end();
+			if (!principal && this.#options.auth) {
+				writeHtml(response, 200, renderAgentWebPage());
 				return;
 			}
 			if (!principal && this.#options.authToken) {
@@ -140,6 +136,55 @@ export class AgentApiServer {
 				throw new HttpError(401, "unauthorized", "Authentication required");
 			}
 			writeHtml(response, 200, renderAgentWebPage());
+			return;
+		}
+
+		if (pathname === "/auth/device/start") {
+			if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const auth = this.#requireDeviceAuth();
+			const principal = await this.#authenticate(request);
+			if (principal && principal.source !== "anonymous") {
+				writeJson(response, 200, { status: "authenticated", user: publicPrincipal(principal) });
+				return;
+			}
+			const result = await auth.startDeviceLogin();
+			response.setHeader("Set-Cookie", result.setCookie);
+			writeJson(response, 200, {
+				status: "pending",
+				loginId: result.loginId,
+				userCode: result.userCode,
+				verificationUri: result.verificationUri,
+				...(result.intervalSeconds === undefined ? {} : { intervalSeconds: result.intervalSeconds }),
+				expiresAt: result.expiresAt,
+			});
+			return;
+		}
+
+		if (pathname === "/auth/device/status") {
+			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const auth = this.#requireDeviceAuth();
+			const loginId = this.#query(request).searchParams.get("loginId");
+			if (!loginId) throw new HttpError(400, "invalid_request", "loginId is required");
+			const result = await auth.getDeviceLoginStatus(loginId, request.headers.cookie);
+			writeDeviceLoginStatus(response, result);
+			return;
+		}
+
+		if (pathname === "/auth/device/cancel") {
+			if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const auth = this.#requireDeviceAuth();
+			const loginId = this.#query(request).searchParams.get("loginId");
+			if (!loginId) throw new HttpError(400, "invalid_request", "loginId is required");
+			response.setHeader("Set-Cookie", await auth.cancelDeviceLogin(loginId, request.headers.cookie));
+			writeJson(response, 200, { status: "cancelled" });
+			return;
+		}
+
+		if (pathname === "/auth/logout") {
+			if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
+			const auth = this.#requireAuth();
+			response.setHeader("Set-Cookie", await auth.logout(request.headers.cookie));
+			writeJson(response, 200, { ok: true });
 			return;
 		}
 
@@ -153,48 +198,13 @@ export class AgentApiServer {
 			return;
 		}
 
-		if (pathname === "/auth/hiworks/login") {
-			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-			const auth = this.#requireHiworksAuth();
-			const login = auth.startLogin();
-			response.writeHead(302, {
-				Location: login.location,
-				"Cache-Control": "no-store",
-				"Set-Cookie": login.setCookie,
-			});
-			response.end();
-			return;
-		}
-
-		if (this.#options.hiworksAuth?.callbackPath === pathname) {
-			if (request.method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-			const auth = this.#requireHiworksAuth();
-			const callbackUrl = new URL(request.url ?? "/", "http://localhost");
-			const completion = await auth.completeLogin(callbackUrl, request.headers.cookie);
-			response.writeHead(303, {
-				Location: "/",
-				"Cache-Control": "no-store",
-				"Referrer-Policy": "no-referrer",
-				"Set-Cookie": [...completion.setCookies],
-			});
-			response.end();
-			return;
-		}
-
-		if (pathname === "/auth/hiworks/logout") {
-			if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed");
-			const auth = this.#requireHiworksAuth();
-			response.setHeader("Set-Cookie", auth.logout(request.headers.cookie));
-			writeJson(response, 200, { ok: true });
-			return;
-		}
-
 		const principal = await this.#authenticate(request);
 		if (!principal) {
 			if (this.#options.authToken) response.setHeader("WWW-Authenticate", "Bearer");
 			throw new HttpError(401, "unauthorized", "Authentication required");
 		}
-		const ownerId = principal.source === "hiworks" ? principal.id : undefined;
+		const ownerId =
+			principal.source === "server_token" || principal.source === "anonymous" ? undefined : principal.id;
 
 		const parts = pathname
 			.split("/")
@@ -306,6 +316,14 @@ export class AgentApiServer {
 		}
 	}
 
+	#query(request: IncomingMessage): URL {
+		try {
+			return new URL(request.url ?? "/", "http://localhost");
+		} catch {
+			throw new HttpError(400, "invalid_url", "Invalid request URL");
+		}
+	}
+
 	#decodeSegment(segment: string): string {
 		try {
 			return decodeURIComponent(segment);
@@ -327,7 +345,7 @@ export class AgentApiServer {
 		if (this.#isServerTokenAuthorized(request)) {
 			return { id: "server-token", source: "server_token", admin: true };
 		}
-		const auth = this.#options.hiworksAuth;
+		const auth = this.#options.auth;
 		if (auth) {
 			const principal = await auth.authenticate(request.headers.cookie);
 			if (principal) return principal;
@@ -338,9 +356,17 @@ export class AgentApiServer {
 		return undefined;
 	}
 
-	#requireHiworksAuth(): AgentAuthService {
-		const auth = this.#options.hiworksAuth;
-		if (!auth) throw new HttpError(404, "auth_not_configured", "Hiworks authentication is not configured");
+	#requireAuth(): AgentAuthService {
+		const auth = this.#options.auth;
+		if (!auth) throw new HttpError(404, "auth_not_configured", "Authentication is not configured");
+		return auth;
+	}
+
+	#requireDeviceAuth(): AgentDeviceAuthService {
+		const auth = this.#options.auth;
+		if (!auth || !isDeviceAuthService(auth)) {
+			throw new HttpError(404, "auth_not_configured", "Codex device authentication is not configured");
+		}
 		return auth;
 	}
 
@@ -370,7 +396,7 @@ function publicPrincipal(principal: AgentPrincipal): {
 	id: string;
 	source: AgentPrincipal["source"];
 	admin: boolean;
-	profile?: AgentPrincipal["profile"];
+	accountId?: string;
 	email?: string;
 	displayName?: string;
 } {
@@ -378,10 +404,23 @@ function publicPrincipal(principal: AgentPrincipal): {
 		id: principal.id,
 		source: principal.source,
 		admin: principal.admin,
-		...(principal.profile ? { profile: principal.profile } : {}),
+		...(principal.accountId ? { accountId: principal.accountId } : {}),
 		...(principal.email ? { email: principal.email } : {}),
 		...(principal.displayName ? { displayName: principal.displayName } : {}),
 	};
+}
+
+function writeDeviceLoginStatus(response: ServerResponse, result: DeviceLoginStatus): void {
+	if (result.status === "complete") {
+		response.setHeader("Set-Cookie", result.setCookies);
+		writeJson(response, 200, {
+			status: result.status,
+			authenticated: true,
+			user: publicPrincipal(result.user),
+		});
+		return;
+	}
+	writeJson(response, 200, result);
 }
 
 function writeHtml(response: ServerResponse, statusCode: number, html: string): void {
@@ -405,6 +444,31 @@ function writeJson(response: ServerResponse, statusCode: number, value: unknown)
 }
 
 async function readRunRequest(request: IncomingMessage, maxBodyBytes: number): Promise<AgentRunRequest> {
+	const body = await readJsonObject(request, maxBodyBytes);
+	if (typeof body.input !== "string" || body.input.trim().length === 0) {
+		throw new HttpError(400, "invalid_request", "input must be a non-empty string");
+	}
+	if (body.conversationId !== undefined) {
+		throw new HttpError(400, "invalid_request", "Use sessionId instead of conversationId");
+	}
+	if (body.sessionId !== undefined) {
+		if (typeof body.sessionId !== "string" || !isSafeIdentifier(body.sessionId)) {
+			throw new HttpError(400, "invalid_request", "sessionId contains unsupported characters");
+		}
+		return { input: body.input, sessionId: body.sessionId };
+	}
+	return { input: body.input };
+}
+
+function isDeviceAuthService(auth: AgentAuthService): auth is AgentDeviceAuthService {
+	return (
+		typeof (auth as Partial<AgentDeviceAuthService>).startDeviceLogin === "function" &&
+		typeof (auth as Partial<AgentDeviceAuthService>).getDeviceLoginStatus === "function" &&
+		typeof (auth as Partial<AgentDeviceAuthService>).cancelDeviceLogin === "function"
+	);
+}
+
+async function readJsonObject(request: IncomingMessage, maxBodyBytes: number): Promise<Record<string, unknown>> {
 	const contentLength = request.headers["content-length"];
 	if (contentLength !== undefined) {
 		const length = Number(contentLength);
@@ -432,20 +496,7 @@ async function readRunRequest(request: IncomingMessage, maxBodyBytes: number): P
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new HttpError(400, "invalid_request", "Request body must be an object");
 	}
-	const body = value as Record<string, unknown>;
-	if (typeof body.input !== "string" || body.input.trim().length === 0) {
-		throw new HttpError(400, "invalid_request", "input must be a non-empty string");
-	}
-	if (body.conversationId !== undefined) {
-		throw new HttpError(400, "invalid_request", "Use sessionId instead of conversationId");
-	}
-	if (body.sessionId !== undefined) {
-		if (typeof body.sessionId !== "string" || !isSafeIdentifier(body.sessionId)) {
-			throw new HttpError(400, "invalid_request", "sessionId contains unsupported characters");
-		}
-		return { input: body.input, sessionId: body.sessionId };
-	}
-	return { input: body.input };
+	return value as Record<string, unknown>;
 }
 
 function formatSse(event: AgentRunEvent): string {

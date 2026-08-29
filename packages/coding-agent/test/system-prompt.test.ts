@@ -126,4 +126,22 @@ describe("buildSystemPrompt", () => {
 			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
 		});
 	});
+
+	describe("project philosophy", () => {
+		test("includes minimize-first guidance in the default prompt", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain(
+				"- Project philosophy: prefer less over more. Include only what is necessary; if something is not required, leave it out",
+			);
+			expect(prompt).toContain(
+				"- For user-facing interfaces, keep each screen focused on one clear purpose and expose only the minimum functionality needed for that purpose; do not add extra features or controls unless they are necessary for that purpose",
+			);
+		});
+	});
 });

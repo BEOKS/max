@@ -521,8 +521,8 @@ export const openaiCodexOAuth: OAuthAuth = {
 			type: "select",
 			message: "Select OpenAI Codex login method:",
 			options: [
-				{ id: OPENAI_CODEX_BROWSER_LOGIN_METHOD, label: "Browser login (default)" },
-				{ id: OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD, label: "Device code login (headless)" },
+				{ id: OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD, label: "Device code login (default)" },
+				{ id: OPENAI_CODEX_BROWSER_LOGIN_METHOD, label: "Browser login" },
 			],
 		});
 
